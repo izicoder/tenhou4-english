@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English + Compact Tile Names
 // @name:ja      天鳳 /4 英語化 + 英語牌名
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.3.1
+// @version      0.3.2
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K) and draws always-on compact English tile names over every face-up tile.
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -108,11 +108,13 @@
     reloadWarned: false,
     insertionHooks: false,
     observer: false,
+    styleObserver: false,
+    styleInvalidations: 0,
     disabledReason: IS_DESKTOP4K ? "" : "not a /4/ page",
   };
 
   const tileOverlay = {
-    version: "0.3.1",
+    version: "0.3.2",
     mode: "compact",
     scope: "all face-up tiles",
     enabled: true,
@@ -439,6 +441,30 @@
     for (let i = 0; i < scripts.length; i++) patchExistingScript(scripts[i]);
   }
 
+  function ensureOverlayForCanvas(canvas) {
+    if (!canvas || isOverlayCanvas(canvas)) return false;
+    if (canvas.tagName !== "CANVAS") return false;
+    if (!(canvas.width > 100 && canvas.height > 100)) return false;
+    if (!canvas.parentNode) return false;
+    if (!overlayRecords.has(canvas)) getOverlay(canvas);
+    visibilityCache.delete(canvas);
+    return true;
+  }
+
+  function ensureOverlayForTree(node) {
+    if (!node) return 0;
+    if (node.nodeType === 1 && node.tagName === "CANVAS") {
+      return ensureOverlayForCanvas(node) ? 1 : 0;
+    }
+    if (node.nodeType === 1 || node.nodeType === 9 || node.nodeType === 11) {
+      let count = 0;
+      const kids = node.childNodes;
+      for (let i = 0; i < kids.length; i++) count += ensureOverlayForTree(kids[i]);
+      return count;
+    }
+    return 0;
+  }
+
   function installInsertionHooks() {
     const nodeProto = W.Node && W.Node.prototype;
     if (!nodeProto) {
@@ -479,7 +505,13 @@
     try {
       const mo = new W.MutationObserver((muts) => {
         for (const m of muts) {
-          for (const n of m.addedNodes) patchScriptTree(n);
+          for (const n of m.addedNodes) {
+            patchScriptTree(n);
+            ensureOverlayForTree(n);
+            if (n.nodeType === 1 && n.tagName === "CANVAS") {
+              visibilityCache.delete(n);
+            }
+          }
         }
       });
       mo.observe(D, { childList: true, subtree: true });
@@ -490,14 +522,46 @@
     }
   }
 
-  function scheduleScans() {
+  function scanAll() {
     scanExistingClientScripts();
-    W.setTimeout(scanExistingClientScripts, 0);
-    W.setTimeout(scanExistingClientScripts, 50);
-    W.setTimeout(scanExistingClientScripts, 250);
-    D.addEventListener("DOMContentLoaded", scanExistingClientScripts, {
-      once: true,
-    });
+    ensureOverlayForTree(D.documentElement || D);
+  }
+
+  function installStyleObserver() {
+    if (!W.MutationObserver) {
+      pushClientError("MutationObserver unavailable for style observer");
+      return;
+    }
+    try {
+      const mo = new W.MutationObserver((muts) => {
+        for (const m of muts) {
+          const t = m.target;
+          if (t && t.tagName === "CANVAS") {
+            visibilityCache.delete(t);
+            const rec = overlayRecords.get(t);
+            if (rec) rec.dirty = true;
+            clientHook.styleInvalidations++;
+          }
+        }
+      });
+      mo.observe(D, {
+        attributes: true,
+        attributeFilter: ["style", "class"],
+        subtree: true,
+      });
+      clientHook.styleObserver = true;
+    } catch (e) {
+      pushClientError("style observer failed: " + ((e && e.message) || e));
+      recordError(e);
+    }
+  }
+
+  function scheduleScans() {
+    scanAll();
+    W.setTimeout(scanAll, 0);
+    W.setTimeout(scanAll, 50);
+    W.setTimeout(scanAll, 250);
+    D.addEventListener("DOMContentLoaded", scanAll, { once: true });
   }
 
   function normalizeRect(r) {
@@ -559,7 +623,7 @@
     if (!(canvas.width > 0 && canvas.height > 0)) return false;
     const now = Date.now();
     const cached = visibilityCache.get(canvas);
-    if (cached && now - cached.ts < 250) return cached.value;
+    if (cached && now - cached.ts < 16) return cached.value;
     let visible = true;
     try {
       if (canvas.getClientRects && canvas.getClientRects().length === 0) {
@@ -640,6 +704,7 @@
     if (isOverlayCanvas(canvas)) return;
     const rec = overlayRecords.get(canvas);
     if (!rec) return;
+    visibilityCache.delete(canvas);
     syncOverlay(canvas, rec);
     for (const [id, label] of rec.labels) {
       if (intersects(label.rect, r)) rec.labels.delete(id);
@@ -902,6 +967,7 @@
     installScriptHooks();
     installInsertionHooks();
     installClientObserver();
+    installStyleObserver();
     scheduleScans();
     raf(renderFrame);
     if (DEBUG) {
@@ -1565,7 +1631,7 @@
   window.__tenhou4en = debugApi;
 
   console.log(
-    "%c[tenhou4-en] v0.3.1 loaded - compact English tile names are always on" +
+    "%c[tenhou4-en] v0.3.2 loaded - compact English tile names are always on" +
     (IS_DESKTOP4K ? "" : " (tile overlay: /4 only)"),
     "color:#0a0;font-weight:bold"
   );
