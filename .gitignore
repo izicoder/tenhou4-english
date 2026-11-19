@@ -1,0 +1,12 @@
+node_modules/
+
+# Local artifacts: screenshots, coverage reports, captured resources.
+shots/
+*.log
+
+# Credentials and local overrides.
+.env
+.env.*
+*.env
+credentials*
+*.secret

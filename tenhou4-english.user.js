@@ -7,6 +7,10 @@
 // @author       you
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
+// @match        https://tenhou.net/man/*
+// @match        https://tenhou.net/man/
+// @match        https://tenhou.net/reg/*
+// @match        https://tenhou.net/reg/
 // @run-at       document-start
 // @grant        none
 // @license      MIT
@@ -300,11 +304,243 @@
     "以下": "or below",
     "点": "pts",
     "枚": "tiles",
+    // Lobby / room selection.
+    "準備中": "Loading...",
+    "四麻:": "4-player:",
+    "三麻:": "3-player:",
+    "東風戦": "East-only",
+    "東南戦": "East-South",
+    "喰アリ赤": "Kuitan Ari Red",
+    "喰アリ赤速": "Kuitan Ari Red Fast",
+    "喰アリ赤光": "Kuitan Ari Red Flash",
+    "三喰赤": "3P Kuitan Red",
+    "三喰赤速": "3P Kuitan Red Fast",
+    // Browser tab title.
+    "天鳳 / Desktop4K版": "Tenhou / Desktop4K",
+    // In-game.
+    "對局": "Game",
+    // /reg/ paid-membership page.
+    "有料版有効期限の購入": "Purchase Paid Membership",
+    "有料会員にのみ提供されているサービス(Windows版天鳳/鳳凰卓での対戦/有料の大会への参加/有料のトレーニングコンテンツ)を利用するには、 １つのプレーヤIDにつき「25日で550円」または「22日500円」の利用料金をお支払いいただく必要があります。 数か月分まとめてお支払いいただくこともできます。 お支払いには以下の決済サービスがご利用いただけます。":
+      'To use services available only to paid members (Windows Tenhou / Phoenix table matches / paid tournament entry / paid training content), you must pay a usage fee of "550 yen for 25 days" or "500 yen for 22 days" per player ID. You can pay for several months at once. The following payment services are accepted.',
+    "- クレジットカード(VISA/MasterCard/JCB/AmericanExpress/Diners/Discover)":
+      "- Credit card (VISA/MasterCard/JCB/AmericanExpress/Diners/Discover)",
+    "- ドコモケータイ払い": "- Docomo Mobile Payment",
+    "- au かんたん決済／au WALLET": "- au Simple Payment / au WALLET",
+    "- WebMoney(コンビニ他/カード/銀行振り込み)":
+      "- WebMoney (convenience store / card / bank transfer)",
+    "- BitCash(コンビニ他/カード/銀行振り込み)":
+      "- BitCash (convenience store / card / bank transfer)",
+    "- NetCash(コンビニ他/カード/銀行振り込み)":
+      "- NetCash (convenience store / card / bank transfer)",
+    "プレーヤIDの３文字目から'-'までの８文字を正確に入力してください。":
+      "Enter the 8 characters from the 3rd character of your Player ID up to the '-'.",
+    "-abcdefgh」の「00112233」に対応する部分":
+      'the "00112233" part of "ID00112233-abcdefgh"',
+    "※アルファベットの部分は大文字で入力してください":
+      "* Enter the alphabetical part in uppercase.",
+    "お問い合わせ": "Contact",
+    "特定商取引に関する法律に基づく表記":
+      "Notation under the Act on Specified Commercial Transactions",
   };
 
   const EXACT = Object.assign({}, MISC, RANKS, YAKU);
 
   const WIND = { 東: "East", 南: "South", 西: "West", 北: "North" };
+
+  // Lobby tabs are single characters inside div.tab3 label.btn[for].  They must
+  // not be translated anywhere else (a player name could be 東).
+  const TAB_LABELS = {
+    四: "4P",
+    三: "3P",
+    東: "East",
+    南: "South",
+    鳳: "Phoenix",
+    特: "Expert",
+    雀: "Jansou",
+  };
+
+  // The round indicator (東1局) is split into separate text nodes: 東 / 1 / 局.
+  // Match the parent's reconstructed text, never a lone wind character, and
+  // rewrite the child nodes in place so the client keeps its own elements.
+  const ROUND_RE = /^([東南西北])(\d+)局$/;
+
+  // The in-game panel wraps the round and seat wind in nested spans inside
+  // div.nopp, e.g. <div class=nopp><span>東</span><span>1</span><span>局</span>.
+  const NOPP_ROUND_RE = /^([東南西北])(\d+)局$/;
+  const NOPP_SEAT_RE = /^([東南西北])\s+(.+)$/;
+
+  // Original value of every text node we have rewritten.  Lets us rebuild the
+  // parent string on later mutations (the digit changes, 東 and 局 do not).
+  const ORIGINALS = new WeakMap();
+
+  function originalValue(node) {
+    return ORIGINALS.has(node) ? ORIGINALS.get(node) : node.nodeValue;
+  }
+
+  function setNodeValue(node, value) {
+    if (!ORIGINALS.has(node)) ORIGINALS.set(node, node.nodeValue);
+    if (node.nodeValue !== value) node.nodeValue = value;
+  }
+
+  function childTextNodes(parent) {
+    const doc = parent.ownerDocument;
+    if (!doc) return [];
+    const out = [];
+    // NodeFilter.SHOW_TEXT === 4; avoid the global, which can be gone after a
+    // window closes (jsdom) or during teardown.
+    const w = doc.createTreeWalker(parent, 4, null);
+    let n;
+    while ((n = w.nextNode())) out.push(n);
+    return out;
+  }
+
+  function translateNoppContainer(node) {
+    const start = node.parentElement;
+    if (!start || !start.closest) return false;
+
+    const container = start.closest("div.nopp");
+    if (!container) return false;
+
+    const nodes = childTextNodes(container);
+    if (!nodes.length) return false;
+
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .trim();
+
+    // Round: 東1局 -> East 1
+    let m = NOPP_ROUND_RE.exec(original);
+    if (m) {
+      const wind = WIND[m[1]];
+      for (const n of nodes) {
+        const text = originalValue(n).trim();
+        if (text === m[1]) setNodeValue(n, `${wind} `);
+        else if (text === "局") setNodeValue(n, "");
+      }
+      return true;
+    }
+
+    // Seat wind + score or player name: 南 25000 / 北 COM / 南 vanicake
+    m = NOPP_SEAT_RE.exec(original);
+    if (m) {
+      const wind = WIND[m[1]];
+      for (const n of nodes) {
+        const value = originalValue(n);
+        if (value.trim() === m[1]) {
+          const trailing = /\s$/.test(value) ? " " : "";
+          setNodeValue(n, wind + trailing);
+          break;
+        }
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  function translateRoundParent(node) {
+    const parent = node.parentNode;
+    if (!parent || parent.nodeType !== 1) return false;
+
+    const tag = parent.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
+
+    const nodes = childTextNodes(parent);
+    if (!nodes.length) return false;
+
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .replace(/\s+/g, "");
+    const m = ROUND_RE.exec(original);
+    if (!m) return false;
+
+    const wind = WIND[m[1]];
+    const whole = `${m[1]}${m[2]}局`;
+
+    for (const n of nodes) {
+      const value = originalValue(n);
+      const text = value.trim();
+
+      if (text === whole) {
+        setNodeValue(n, `${wind} ${m[2]}`);
+      } else if (text === m[1]) {
+        setNodeValue(n, `${wind} `);
+      } else if (text === "局") {
+        setNodeValue(n, "");
+      }
+    }
+    return true;
+  }
+
+  // Counters whose number and unit can be split into separate text nodes,
+  // e.g. 3 / 本場 or 12000 / 点.
+  const SPLIT_COUNTER_RE = /^(\d+)(本場|枚|点|翻|飜|符|人|位|戦|日)$/;
+
+  function ordinal(n) {
+    const i = Number(n);
+    const v = i % 100;
+    const s = ["th", "st", "nd", "rd"];
+    return i + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+
+  function counterSuffix(unit, n) {
+    switch (unit) {
+      case "本場":
+        return " Honba";
+      case "枚":
+        return " tiles";
+      case "点":
+        return " pts";
+      case "翻":
+      case "飜":
+        return " han";
+      case "符":
+        return " fu";
+      case "人":
+        return n === "1" ? " player" : " players";
+      case "戦":
+        return " games";
+      case "日":
+        return " days";
+      case "位":
+        return ""; // the number node becomes 1st / 2nd / ...
+    }
+    return null;
+  }
+
+  function translateSplitCounter(node) {
+    const parent = node.parentNode;
+    if (!parent || parent.nodeType !== 1) return false;
+
+    const tag = parent.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
+
+    const nodes = childTextNodes(parent);
+    if (nodes.length < 2) return false; // single node is handled by RULES
+
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .replace(/\s+/g, "");
+    const m = SPLIT_COUNTER_RE.exec(original);
+    if (!m) return false;
+
+    const num = m[1];
+    const unit = m[2];
+
+    for (const n of nodes) {
+      const text = originalValue(n).trim();
+      if (text === unit) {
+        setNodeValue(n, counterSuffix(unit, num));
+      } else if (unit === "位" && text === num) {
+        setNodeValue(n, ordinal(num));
+      }
+    }
+    return true;
+  }
 
   const RULES = [
     // 東1局 / 南3局
@@ -321,6 +557,36 @@
     [/^(\d+)[翻飜]$/, (m) => `${m[1]} han`],
     // 40符
     [/^(\d+)符$/, (m) => `${m[1]} fu`],
+    // 4人 / 1人
+    [/^(\d+)人$/, (m) => `${m[1]} ${m[1] === "1" ? "player" : "players"}`],
+    // 1位 / 2位
+    [/^(\d+)位$/, (m) => ordinal(m[1])],
+    // 100戦
+    [/^(\d+)戦$/, (m) => `${m[1]} games`],
+    // 30日
+    [/^(\d+)日$/, (m) => `${m[1]} days`],
+    // R1800 stays as-is; kept explicit so the rule set is complete.
+    [/^R(\d+)$/, (m) => `R${m[1]}`],
+    // Table name, e.g. 四鳳南喰赤 = 4P Phoenix South Open Red.
+    [
+      /^([四三])(鳳|特|上|一|雀)(東|南)(喰|断)(赤.*)?$/,
+      (m) => {
+        const players = m[1] === "四" ? "4P" : "3P";
+        const tier =
+          { 鳳: "Phoenix", 特: "Expert", 上: "Advanced", 一: "General", 雀: "Jansou" }[
+            m[2]
+          ];
+        const round = m[3] === "東" ? "East" : "South";
+        const rule = m[4] === "喰" ? "Open" : "No Open";
+        let red = "";
+        if (m[5]) {
+          red = " Red";
+          if (m[5].includes("速")) red += " Fast";
+          if (m[5].includes("光")) red += " Flash";
+        }
+        return `${players} ${tier} ${round} ${rule}${red}`;
+      },
+    ],
     // 供託 / ドラ etc. handled by EXACT.
   ];
 
@@ -337,12 +603,68 @@
 
   const seenUnknown = new Set();
 
+  function translateContext(node) {
+    const el = node.parentElement;
+    if (!el || !el.matches) return false;
+
+    // <div class="tab3"><label class="btn" for="wg02">四</label></div>
+    if (el.matches("div.tab3 label.btn[for]")) {
+      const raw = node.nodeValue;
+      const text = raw.trim();
+      const out = TAB_LABELS[text];
+      if (out == null) return false;
+      const i = raw.indexOf(text);
+      node.nodeValue = raw.slice(0, i) + out + raw.slice(i + text.length);
+      return true;
+    }
+    return false;
+  }
+
   function translateTextNode(node) {
     const raw = node.nodeValue;
     if (!raw) return;
 
+    // Never touch executable or style content.  walk() prunes these subtrees,
+    // but characterData callbacks can still land on them.
+    const parent = node.parentNode;
+    if (parent && parent.nodeType === 1) {
+      const ptag = parent.tagName;
+      if (ptag === "SCRIPT" || ptag === "STYLE" || ptag === "TEXTAREA") return;
+    }
+
+    // Player names are user content, never UI strings.
+    const pel = node.parentElement;
+    if (
+      pel &&
+      pel.closest &&
+      pel.closest('a[href*="tenhou.net/0/?wg="]')
+    ) {
+      return;
+    }
+
+    // Context-only labels (single-character lobby tabs).
+    if (translateContext(node)) return;
+
+    // In-game round / seat panel (nested spans inside div.nopp).
+    if (translateNoppContainer(node)) return;
+
+    // Round text is split across sibling nodes; handle it at the parent level.
+    if (translateRoundParent(node)) return;
+
+    // Numbers and their unit may also be separate nodes (3 / 本場).
+    if (translateSplitCounter(node)) return;
+
     const text = raw.trim();
     if (!text) return;
+
+    // Static-page paragraphs can contain newlines/tabs; match them normalized
+    // and replace the whole node.
+    const normalized = text.replace(/\s+/g, " ");
+    const normalizedHit = EXACT[normalized];
+    if (normalizedHit != null && normalizedHit !== normalized) {
+      node.nodeValue = normalizedHit;
+      return;
+    }
 
     const out = translateString(text);
     if (out != null) {
@@ -371,7 +693,10 @@
       if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return;
     }
 
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    const doc = root.nodeType === 9 ? root : root.ownerDocument;
+    if (!doc) return;
+
+    const walker = doc.createTreeWalker(root, 4, null);
     let n;
     while ((n = walker.nextNode())) translateTextNode(n);
   }
@@ -404,6 +729,15 @@
     yaku: YAKU,
     ranks: RANKS,
     misc: MISC,
+    overrides: TABLE_OVERRIDES,
+    patchTable,
+    translateString,
+    translateTextNode,
+    translateContext,
+    translateNoppContainer,
+    translateRoundParent,
+    translateSplitCounter,
+    walk,
     add(ja, en) {
       EXACT[ja] = en;
       walk(document.body);
