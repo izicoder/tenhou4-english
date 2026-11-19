@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Tenhou /4 English (full)
-// @name:ja      天鳳 /4 英語化
+// @name         Tenhou /4 English + Tile Overlay
+// @name:ja      天鳳 /4 英語化 + 牌ラベル
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.1.2
-// @description  Completes the English UI on tenhou.net/4 (Desktop4K) and translates the Japanese the official EN option leaves behind.
+// @version      0.2.0
+// @description  Completes the English UI on tenhou.net/4 (Desktop4K) and adds Majsoul-style tile number/letter overlays.
 // @author       you
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
@@ -19,17 +19,14 @@
 /*
  * How this works
  * --------------
- * The /4 client keeps its UI strings in a per-language table loaded from
- *   https://cdn.tenhou.net/4/res/lang/string<date>_<lang>.json
- * and looks them up as  hb[lang][id] || hb.en[id] || hb.ja[id].
+ * 1. String-table patch (official EN JSON)
+ * 2. MutationObserver for hard-coded Japanese strings
+ * 3. Tile Overlay (Majsoul-style indices)
  *
- * The official EN table is missing a few ids and leaves a few values in
- * Japanese.  We intercept the XHR for the EN table and merge our overrides
- * in, so the client itself renders English everywhere the table is used.
- *
- * Everything else (yaku names, ranks, room names, counters) is hard-coded
- * Japanese inside latest.js and written into the DOM, so a MutationObserver
- * swaps those text nodes by exact match.
+ * Toggle the overlay anytime with:
+ *   localStorage.setItem("tenhou4enTiles", "1")   // on
+ *   localStorage.setItem("tenhou4enTiles", "0")   // off
+ * or press  Ctrl+Shift+T
  */
 
 (function () {
@@ -49,34 +46,19 @@
     })();
 
   // ---------------------------------------------------------------- language
-
-  // Must happen before latest.js reads it.  "en" and "EN" both resolve to en.
   try {
     localStorage.setItem("lang", "en");
-  } catch (e) {
-    /* private mode etc. */
-  }
+  } catch (e) { }
 
   // ------------------------------------------------------- string table patch
-
   const LANG_URL_RE = /\/res\/lang\/string\d+_en\.json(?:[?#]|$)/;
 
-  // IDs the official EN table is missing (20, 214, 1029, 1103) or leaves in
-  // Japanese (223-226, 300, 301, 341).
   const TABLE_OVERRIDES = {
     20: ["Default", "2 TAPs", "3 TAPs"],
-
     214: [
-      "General",
-      "Advanced",
-      "Expert",
-      "Phoenix",
-      "Wakaba",
-      "Silver",
-      "Amber",
-      "Peacock",
+      "General", "Advanced", "Expert", "Phoenix",
+      "Wakaba", "Silver", "Amber", "Peacock",
     ],
-
     223:
       "You don't meet the requirements for <b>Advanced</b> tables " +
       "(1 Kyu or above, or 60+ days of Premium). " +
@@ -90,17 +72,14 @@
     226:
       "You don't meet the requirements for <b>Jansou</b> tables " +
       "(Premium + 4 Dan / R1800 or above).",
-
     300: "Private Room",
     301: "Tournament",
     341: "<div class=desc>(Ranked / Jansou)</div>",
-
     1029:
       "ID or password is incorrect. You can reset your password on the " +
       "member page below.<br>" +
       "<a href='https://ron2.jp/3/member/' target=_blank>https://ron2.jp/3/member/</a><br>" +
       "Contact: support@ron2.jp",
-
     1103:
       "Special Promotion tables are open daily 21:00-25:00 (JST). " +
       "Entry requires 100 games played and R1800 or above.",
@@ -115,7 +94,6 @@
     }
     if (!obj) return null;
 
-    // The server may send either {id: text} or [id, text, id, text, ...].
     if (Array.isArray(obj)) {
       const o = {};
       for (let i = 0; i + 1 < obj.length; i += 2) o[obj[i]] = obj[i + 1];
@@ -133,9 +111,7 @@
   XHR.open = function (method, url) {
     try {
       this.__tenhouUrl = String(url);
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) { }
     return nativeOpen.apply(this, arguments);
   };
 
@@ -151,7 +127,6 @@
         try {
           value = desc.get.call(this);
         } catch (e) {
-          // responseText throws when responseType is not "" / "text".
           return undefined;
         }
 
@@ -176,9 +151,6 @@
   }
 
   // ------------------------------------------------------------- DOM strings
-
-  // Yaku ids are indices into the client's hard-coded Japanese array, and the
-  // result panel writes them straight into <div class="ym"> / <div class="yk">.
   const YAKU = {
     "門前清自摸和": "Menzen Tsumo",
     "立直": "Riichi",
@@ -241,8 +213,6 @@
     "本場": "Honba",
     "明槓": "Open Kan",
     "暗槓": "Closed Kan",
-    // Non-standard labels at the end of the client's array.  Transliterated;
-    // verify against a real game if they ever show up.
     "五": "Five",
     "ガリ": "Gari",
     "セット": "Set",
@@ -253,26 +223,13 @@
 
   const RANKS = {
     "新人": "Newcomer",
-    "１級": "1 Kyu",
-    "２級": "2 Kyu",
-    "３級": "3 Kyu",
-    "４級": "4 Kyu",
-    "５級": "5 Kyu",
-    "６級": "6 Kyu",
-    "７級": "7 Kyu",
-    "８級": "8 Kyu",
-    "９級": "9 Kyu",
-    "初段": "1 Dan",
-    "二段": "2 Dan",
-    "三段": "3 Dan",
-    "四段": "4 Dan",
-    "五段": "5 Dan",
-    "六段": "6 Dan",
-    "七段": "7 Dan",
-    "八段": "8 Dan",
-    "九段": "9 Dan",
-    "十段": "10 Dan",
-    "天鳳": "Tenhou",
+    "１級": "1 Kyu", "２級": "2 Kyu", "３級": "3 Kyu",
+    "４級": "4 Kyu", "５級": "5 Kyu", "６級": "6 Kyu",
+    "７級": "7 Kyu", "８級": "8 Kyu", "９級": "9 Kyu",
+    "初段": "1 Dan", "二段": "2 Dan", "三段": "3 Dan",
+    "四段": "4 Dan", "五段": "5 Dan", "六段": "6 Dan",
+    "七段": "7 Dan", "八段": "8 Dan", "九段": "9 Dan",
+    "十段": "10 Dan", "天鳳": "Tenhou",
   };
 
   const MISC = {
@@ -304,8 +261,6 @@
     "以下": "or below",
     "点": "pts",
     "枚": "tiles",
-    // Limit hands and result-screen terms.  Tenhou uses the traditional
-    // forms (滿 / 數 / 役滿); the simplified forms are kept as a fallback.
     "滿貫": "Mangan",
     "跳滿": "Haneman",
     "倍滿": "Baiman",
@@ -326,7 +281,6 @@
     "段位": "Dan Rank",
     "聴牌": "Tenpai",
     "不聴": "Noten",
-    // Lobby / room selection.
     "準備中": "Loading...",
     "四麻:": "4-player:",
     "三麻:": "3-player:",
@@ -337,15 +291,11 @@
     "喰アリ赤光": "Kuitan Ari Red Flash",
     "三喰赤": "3P Kuitan Red",
     "三喰赤速": "3P Kuitan Red Fast",
-    // Lobby notice bar (outage announcement).
     "10/21,11/08に発生した障害の戦績修正を受け付けています":
       "Accepting results corrections for the 10/21 and 11/08 outages",
     "※喰断ナシON/OFF": "* Kuitan Nashi ON/OFF",
-    // Browser tab title.
     "天鳳 / Desktop4K版": "Tenhou / Desktop4K",
-    // In-game.
     "對局": "Game",
-    // /reg/ paid-membership page.
     "有料版有効期限の購入": "Purchase Paid Membership",
     "有料会員にのみ提供されているサービス(Windows版天鳳/鳳凰卓での対戦/有料の大会への参加/有料のトレーニングコンテンツ)を利用するには、 １つのプレーヤIDにつき「25日で550円」または「22日500円」の利用料金をお支払いいただく必要があります。 数か月分まとめてお支払いいただくこともできます。 お支払いには以下の決済サービスがご利用いただけます。":
       'To use services available only to paid members (Windows Tenhou / Phoenix table matches / paid tournament entry / paid training content), you must pay a usage fee of "550 yen for 25 days" or "500 yen for 22 days" per player ID. You can pay for several months at once. The following payment services are accepted.',
@@ -371,33 +321,16 @@
   };
 
   const EXACT = Object.assign({}, MISC, RANKS, YAKU);
-
   const WIND = { 東: "East", 南: "South", 西: "West", 北: "North" };
 
-  // Lobby tabs are single characters inside div.tab3 label.btn[for].  They must
-  // not be translated anywhere else (a player name could be 東).
   const TAB_LABELS = {
-    四: "4P",
-    三: "3P",
-    東: "East",
-    南: "South",
-    鳳: "Phoenix",
-    特: "Expert",
-    雀: "Jansou",
+    四: "4P", 三: "3P", 東: "East", 南: "South",
+    鳳: "Phoenix", 特: "Expert", 雀: "Jansou",
   };
 
-  // The round indicator (東1局) is split into separate text nodes: 東 / 1 / 局.
-  // Match the parent's reconstructed text, never a lone wind character, and
-  // rewrite the child nodes in place so the client keeps its own elements.
   const ROUND_RE = /^([東南西北])(\d+)局$/;
-
-  // The in-game panel wraps the round and seat wind in nested spans inside
-  // div.nopp, e.g. <div class=nopp><span>東</span><span>1</span><span>局</span>.
   const NOPP_ROUND_RE = /^([東南西北])(\d+)局$/;
   const NOPP_SEAT_RE = /^([東南西北])\s+(.+)$/;
-
-  // Original value of every text node we have rewritten.  Lets us rebuild the
-  // parent string on later mutations (the digit changes, 東 and 局 do not).
   const ORIGINALS = new WeakMap();
 
   function originalValue(node) {
@@ -413,8 +346,6 @@
     const doc = parent.ownerDocument;
     if (!doc) return [];
     const out = [];
-    // NodeFilter.SHOW_TEXT === 4; avoid the global, which can be gone after a
-    // window closes (jsdom) or during teardown.
     const w = doc.createTreeWalker(parent, 4, null);
     let n;
     while ((n = w.nextNode())) out.push(n);
@@ -424,19 +355,14 @@
   function translateNoppContainer(node) {
     const start = node.parentElement;
     if (!start || !start.closest) return false;
-
     const container = start.closest("div.nopp");
     if (!container) return false;
 
     const nodes = childTextNodes(container);
     if (!nodes.length) return false;
 
-    const original = nodes
-      .map(originalValue)
-      .join("")
-      .trim();
+    const original = nodes.map(originalValue).join("").trim();
 
-    // Round: 東1局 -> East 1
     let m = NOPP_ROUND_RE.exec(original);
     if (m) {
       const wind = WIND[m[1]];
@@ -448,7 +374,6 @@
       return true;
     }
 
-    // Seat wind + score or player name: 南 25000 / 北 COM / 南 vanicake
     m = NOPP_SEAT_RE.exec(original);
     if (m) {
       const wind = WIND[m[1]];
@@ -462,7 +387,6 @@
       }
       return true;
     }
-
     return false;
   }
 
@@ -474,9 +398,6 @@
     return RANK_WORDS;
   }
 
-  // Result dialog: the seat wind is a lone text node before the player name,
-  // e.g. [西][ COM][25000][-2600].  Translate it only when it is the first
-  // text of a box that also shows a score, so a bare 東 elsewhere is safe.
   function translateResultSeat(node) {
     const text = node.nodeValue.trim();
     if (!WIND[text]) return false;
@@ -486,8 +407,6 @@
       const nodes = childTextNodes(box).filter((n) => originalValue(n).trim());
       if (!nodes.length || nodes[0] !== node) continue;
       const joined = nodes.map(originalValue).join(" ");
-      // Result dialog: a score follows.  Match-start dialog: a rank follows
-      // (東 / 新人 / COM).  Either way the wind is the first text of its box.
       const nextText = nodes[1] ? originalValue(nodes[1]).trim() : "";
       if (/\d{4,6}/.test(joined) || rankWords().has(nextText)) {
         setNodeValue(node, WIND[text] + " ");
@@ -500,17 +419,13 @@
   function translateRoundParent(node) {
     const parent = node.parentNode;
     if (!parent || parent.nodeType !== 1) return false;
-
     const tag = parent.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
 
     const nodes = childTextNodes(parent);
     if (!nodes.length) return false;
 
-    const original = nodes
-      .map(originalValue)
-      .join("")
-      .replace(/\s+/g, "");
+    const original = nodes.map(originalValue).join("").replace(/\s+/g, "");
     const m = ROUND_RE.exec(original);
     if (!m) return false;
 
@@ -520,20 +435,13 @@
     for (const n of nodes) {
       const value = originalValue(n);
       const text = value.trim();
-
-      if (text === whole) {
-        setNodeValue(n, `${wind} ${m[2]}`);
-      } else if (text === m[1]) {
-        setNodeValue(n, `${wind} `);
-      } else if (text === "局") {
-        setNodeValue(n, "");
-      }
+      if (text === whole) setNodeValue(n, `${wind} ${m[2]}`);
+      else if (text === m[1]) setNodeValue(n, `${wind} `);
+      else if (text === "局") setNodeValue(n, "");
     }
     return true;
   }
 
-  // Counters whose number and unit can be split into separate text nodes,
-  // e.g. 3 / 本場 or 12000 / 点.
   const SPLIT_COUNTER_RE = /^(\d+)(本場|枚|点|翻|飜|符|人|位|戦|日)$/;
 
   function ordinal(n) {
@@ -545,25 +453,16 @@
 
   function counterSuffix(unit, n) {
     switch (unit) {
-      case "本場":
-        return " Honba";
-      case "枚":
-        return " tiles";
-      case "点":
-        return " pts";
+      case "本場": return " Honba";
+      case "枚": return " tiles";
+      case "点": return " pts";
       case "翻":
-      case "飜":
-        return " han";
-      case "符":
-        return " fu";
-      case "人":
-        return n === "1" ? " player" : " players";
-      case "戦":
-        return " games";
-      case "日":
-        return " days";
-      case "位":
-        return ""; // the number node becomes 1st / 2nd / ...
+      case "飜": return " han";
+      case "符": return " fu";
+      case "人": return n === "1" ? " player" : " players";
+      case "戦": return " games";
+      case "日": return " days";
+      case "位": return "";
     }
     return null;
   }
@@ -571,17 +470,13 @@
   function translateSplitCounter(node) {
     const parent = node.parentNode;
     if (!parent || parent.nodeType !== 1) return false;
-
     const tag = parent.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
 
     const nodes = childTextNodes(parent);
-    if (nodes.length < 2) return false; // single node is handled by RULES
+    if (nodes.length < 2) return false;
 
-    const original = nodes
-      .map(originalValue)
-      .join("")
-      .replace(/\s+/g, "");
+    const original = nodes.map(originalValue).join("").replace(/\s+/g, "");
     const m = SPLIT_COUNTER_RE.exec(original);
     if (!m) return false;
 
@@ -590,35 +485,19 @@
 
     for (const n of nodes) {
       const text = originalValue(n).trim();
-      if (text === unit) {
-        setNodeValue(n, counterSuffix(unit, num));
-      } else if (unit === "位" && text === num) {
-        setNodeValue(n, ordinal(num));
-      }
+      if (text === unit) setNodeValue(n, counterSuffix(unit, num));
+      else if (unit === "位" && text === num) setNodeValue(n, ordinal(num));
     }
     return true;
   }
 
-  // Table names are generated by the client as:
-  //   [四三][tier][東南] + (喰|断)? + 赤? + (速|光)? + 祝N?
-  // e.g. 四鳳南喰赤 = 4P Phoenix South Open Red
-  //      四若東速祝５ = 4P Wakaba East Fast Anniv 5
   const TABLE_TIERS = {
-    般: "General",
-    上: "Advanced",
-    特: "Expert",
-    鳳: "Phoenix",
-    若: "Wakaba",
-    銀: "Silver",
-    琥: "Amber",
-    孔: "Peacock",
-    雀: "Jansou",
+    般: "General", 上: "Advanced", 特: "Expert", 鳳: "Phoenix",
+    若: "Wakaba", 銀: "Silver", 琥: "Amber", 孔: "Peacock", 雀: "Jansou",
   };
 
   function translateTableName(text) {
-    const m = /^([四三])([般上特鳳若銀琥孔雀])([東南])(喰|断)?(赤)?(速|光)?(祝[０-９0-9]?)?$/.exec(
-      text
-    );
+    const m = /^([四三])([般上特鳳若銀琥孔雀])([東南])(喰|断)?(赤)?(速|光)?(祝[０-９0-9]?)?$/.exec(text);
     if (!m) return null;
     const parts = [
       m[1] === "四" ? "4P" : "3P",
@@ -631,71 +510,49 @@
     if (m[6] === "速") parts.push("Fast");
     else if (m[6] === "光") parts.push("Flash");
     if (m[7]) {
-      const n = m[7]
-        .slice(1)
-        .replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
+      const n = m[7].slice(1).replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
       parts.push(n ? `Anniv ${n}` : "Anniv");
     }
     return parts.join(" ");
   }
 
   const RULES = [
-    // 東1局 / 南3局
     [/^([東南西北])(\d+)局$/, (m) => `${WIND[m[1]]} ${m[2]}`],
-    // 東場
     [/^([東南西北])場$/, (m) => `${WIND[m[1]]} Round`],
-    // 3本場
     [/^(\d+)本場$/, (m) => `${m[1]} Honba`],
-    // 25枚
     [/^(\d+)枚$/, (m) => `${m[1]} tiles`],
-    // 12000点
     [/^(\d+)点$/, (m) => `${m[1]} pts`],
-    // 3翻
     [/^(\d+)[翻飜]$/, (m) => `${m[1]} han`],
-    // 40符
     [/^(\d+)符$/, (m) => `${m[1]} fu`],
-    // 4人 / 1人
     [/^(\d+)人$/, (m) => `${m[1]} ${m[1] === "1" ? "player" : "players"}`],
-    // 1位 / 2位
     [/^(\d+)位$/, (m) => ordinal(m[1])],
-    // 100戦
     [/^(\d+)戦$/, (m) => `${m[1]} games`],
-    // 30日
     [/^(\d+)日$/, (m) => `${m[1]} days`],
-    // R1800 stays as-is; kept explicit so the rule set is complete.
     [/^R(\d+)$/, (m) => `R${m[1]}`],
-    // Table name, generated by the client as:
-    //   [四三][tier][東南] + (喰|断)? + 赤? + (速|光)? + 祝N?
     [/^([四三][般上特鳳若銀琥孔雀][東南][^\s　]*)$/, (m) => translateTableName(m[1])],
-    // Game-select list: table name followed by the player count, e.g.
-    //   四般東喰赤　  2:
     [
       /^([四三][般上特鳳若銀琥孔雀][東南][^\s　]*)[\s　]+(\d+):$/,
       (m) => `${translateTableName(m[1])}  ${m[2]}:`,
     ],
-    // Room notes in the game-select list: ※四麻上級卓 etc.
     [
       /^※([四三])麻(一般卓|上級卓|特上卓|鳳凰卓|若葉卓|雀荘戦)$/,
       (m) => {
-        const table =
-          {
-            一般卓: "General table",
-            上級卓: "Advanced table",
-            特上卓: "Expert table",
-            鳳凰卓: "Phoenix table",
-            若葉卓: "Wakaba table",
-            雀荘戦: "Jansou match",
-          }[m[2]];
+        const table = {
+          一般卓: "General table",
+          上級卓: "Advanced table",
+          特上卓: "Expert table",
+          鳳凰卓: "Phoenix table",
+          若葉卓: "Wakaba table",
+          雀荘戦: "Jansou match",
+        }[m[2]];
         return `* ${m[1] === "四" ? "4P" : "3P"} ${table}`;
       },
     ],
-    // 供託 / ドラ etc. handled by EXACT.
   ];
 
   function translateString(text) {
     const direct = EXACT[text];
     if (direct != null) return direct;
-
     for (const [re, fn] of RULES) {
       const m = re.exec(text);
       if (m) return fn(m);
@@ -708,8 +565,6 @@
   function translateContext(node) {
     const el = node.parentElement;
     if (!el || !el.matches) return false;
-
-    // <div class="tab3"><label class="btn" for="wg02">四</label></div>
     if (el.matches("div.tab3 label.btn[for]")) {
       const raw = node.nodeValue;
       const text = raw.trim();
@@ -726,44 +581,24 @@
     const raw = node.nodeValue;
     if (!raw) return;
 
-    // Never touch executable or style content.  walk() prunes these subtrees,
-    // but characterData callbacks can still land on them.
     const parent = node.parentNode;
     if (parent && parent.nodeType === 1) {
       const ptag = parent.tagName;
       if (ptag === "SCRIPT" || ptag === "STYLE" || ptag === "TEXTAREA") return;
     }
 
-    // Player names are user content, never UI strings.
     const pel = node.parentElement;
-    if (
-      pel &&
-      pel.closest &&
-      pel.closest('a[href*="tenhou.net/0/?wg="]')
-    ) {
-      return;
-    }
+    if (pel && pel.closest && pel.closest('a[href*="tenhou.net/0/?wg="]')) return;
 
-    // Context-only labels (single-character lobby tabs).
     if (translateContext(node)) return;
-
-    // In-game round / seat panel (nested spans inside div.nopp).
     if (translateNoppContainer(node)) return;
-
-    // Result dialog seat winds (西 COM 25000 -2600).
     if (translateResultSeat(node)) return;
-
-    // Round text is split across sibling nodes; handle it at the parent level.
     if (translateRoundParent(node)) return;
-
-    // Numbers and their unit may also be separate nodes (3 / 本場).
     if (translateSplitCounter(node)) return;
 
     const text = raw.trim();
     if (!text) return;
 
-    // Static-page paragraphs can contain newlines/tabs; match them normalized
-    // and replace the whole node.
     const normalized = text.replace(/\s+/g, " ");
     const normalizedHit = EXACT[normalized];
     if (normalizedHit != null && normalizedHit !== normalized) {
@@ -828,8 +663,61 @@
   if (document.documentElement) start();
   else document.addEventListener("DOMContentLoaded", start, { once: true });
 
-  // --------------------------------------------------------------- debugging
+  // ===============================================================
+  // TILE OVERLAY  (Majsoul-style indices)
+  // ===============================================================
 
+  let tilesEnabled = true;
+  try {
+    const v = localStorage.getItem("tenhou4enTiles");
+    if (v === "0") tilesEnabled = false;
+  } catch (e) { }
+
+  // Inject CSS for the overlay
+  const style = document.createElement("style");
+  style.textContent = `
+    .tenhou4en-tile-label {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      font-family: "Segoe UI", "Arial", sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      line-height: 1;
+      color: #111;
+      background: rgba(255,255,255,0.82);
+      border-radius: 3px;
+      padding: 1px 3px;
+      pointer-events: none;
+      z-index: 20;
+      text-shadow: 0 0 2px #fff;
+      box-shadow: 0 0 1px rgba(0,0,0,0.4);
+    }
+    .tenhou4en-tile-label.aka {
+      color: #c00;
+      background: rgba(255,230,230,0.9);
+    }
+    .tenhou4en-tile-label.honor {
+      font-size: 12px;
+    }
+  `;
+  document.documentElement.appendChild(style);
+
+  // Simple hotkey: Ctrl+Shift+T
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") {
+      tilesEnabled = !tilesEnabled;
+      try {
+        localStorage.setItem("tenhou4enTiles", tilesEnabled ? "1" : "0");
+      } catch (err) { }
+      document.querySelectorAll(".tenhou4en-tile-label").forEach((el) => {
+        el.style.display = tilesEnabled ? "" : "none";
+      });
+      console.log("[tenhou4-en] Tile overlay:", tilesEnabled ? "ON" : "OFF");
+    }
+  });
+
+  // Debug helper
   window.__tenhou4en = {
     yaku: YAKU,
     ranks: RANKS,
@@ -838,13 +726,18 @@
     patchTable,
     translateString,
     translateTextNode,
-    translateContext,
-    translateNoppContainer,
-    translateResultSeat,
-    rankWords,
-    translateRoundParent,
-    translateSplitCounter,
     walk,
+    tilesEnabled: () => tilesEnabled,
+    toggleTiles() {
+      tilesEnabled = !tilesEnabled;
+      try {
+        localStorage.setItem("tenhou4enTiles", tilesEnabled ? "1" : "0");
+      } catch (e) { }
+      document.querySelectorAll(".tenhou4en-tile-label").forEach((el) => {
+        el.style.display = tilesEnabled ? "" : "none";
+      });
+      return tilesEnabled;
+    },
     add(ja, en) {
       EXACT[ja] = en;
       walk(document.body);
@@ -860,4 +753,9 @@
       return [...found];
     },
   };
+
+  console.log(
+    "%c[tenhou4-en] v0.2.0 loaded — Ctrl+Shift+T toggles tile overlay",
+    "color:#0a0;font-weight:bold"
+  );
 })();
