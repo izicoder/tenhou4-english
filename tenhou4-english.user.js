@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English + Compact Tile Names
 // @name:ja      天鳳 /4 英語化 + 英語牌名
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.3.2
+// @version      0.4.1
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K) and draws always-on compact English tile names over every face-up tile.
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -32,7 +32,9 @@
  * visible game canvas.
  *
  * Labels are permanent: no hotkey, no localStorage on/off switch. Face-down
- * tile backs are skipped. Red fives get a red badge.
+ * tile backs are skipped. Red fives get a red badge. The overlay tracks labels
+ * by canvas position, tolerates short clear/redraw gaps, and reattaches if the
+ * game rebuilds or moves its canvas DOM.
  *
  * Debug / verification:
  *   add ?tenhou_en_debug=1 to the URL (or localStorage.tenhou4enDebug = "1")
@@ -77,6 +79,8 @@
   };
   const AKA_CODES = new Set([0, 10, 20]);
   const SKIP_CODES = new Set([37, 255]); // tile back / unknown
+  // Keep labels through a short clear/redraw gap to avoid one-frame flicker.
+  const CLEAR_GRACE_MS = 96;
 
   const CRC2D = W.CanvasRenderingContext2D;
   const HCE = W.HTMLCanvasElement;
@@ -114,7 +118,7 @@
   };
 
   const tileOverlay = {
-    version: "0.3.2",
+    version: "0.4.1",
     mode: "compact",
     scope: "all face-up tiles",
     enabled: true,
@@ -135,12 +139,14 @@
             width: c.width,
             height: c.height,
             connected: !!c.isConnected,
+            overlayConnected: !!rec.overlay.isConnected,
           },
           labelCount: rec.labels.size,
           sample: Array.from(rec.labels.values()).slice(0, 8).map((l) => ({
             code: l.code,
             name: l.name,
             aka: l.aka,
+            pendingClear: l.pendingSince != null,
             x: Math.round(l.rect.x),
             y: Math.round(l.rect.y),
             w: Math.round(l.rect.w),
@@ -446,7 +452,7 @@
     if (canvas.tagName !== "CANVAS") return false;
     if (!(canvas.width > 100 && canvas.height > 100)) return false;
     if (!canvas.parentNode) return false;
-    if (!overlayRecords.has(canvas)) getOverlay(canvas);
+    getOverlay(canvas); // also repairs a detached or misplaced overlay
     visibilityCache.delete(canvas);
     return true;
   }
@@ -585,6 +591,38 @@
     );
   }
 
+  function normalizeClearRect(x, y, w, h) {
+    x = Number(x);
+    y = Number(y);
+    w = Number(w);
+    h = Number(h);
+    if (![x, y, w, h].every((v) => Number.isFinite(v)) || w === 0 || h === 0) {
+      return null;
+    }
+    return {
+      x: Math.min(x, x + w),
+      y: Math.min(y, y + h),
+      w: Math.abs(w),
+      h: Math.abs(h),
+    };
+  }
+
+  // The source canvas key identifies a tile image/type, not necessarily one
+  // board occurrence. Position-based IDs let duplicate tiles coexist.
+  function labelPositionId(rect) {
+    const q = (v) => Math.round(v); // tolerate subpixel jitter during animation
+    return q(rect.x) + ":" + q(rect.y);
+  }
+
+  function nowMs() {
+    try {
+      if (W.performance && typeof W.performance.now === "function") {
+        return W.performance.now();
+      }
+    } catch (e) { }
+    return Date.now();
+  }
+
   function parseDrawArgs(img, args) {
     const n = args.length;
     const iw = Number(img && (img.width || img.naturalWidth)) || 0;
@@ -638,9 +676,21 @@
     return visible;
   }
 
+  function ensureOverlayPlacement(canvas, rec) {
+    const parent = canvas && canvas.parentNode;
+    if (!parent || !rec || !rec.overlay) return false;
+    if (rec.overlay.parentNode !== parent || canvas.nextSibling !== rec.overlay) {
+      parent.insertBefore(rec.overlay, canvas.nextSibling);
+    }
+    return true;
+  }
+
   function getOverlay(canvas) {
     let rec = overlayRecords.get(canvas);
-    if (rec) return rec;
+    if (rec) {
+      ensureOverlayPlacement(canvas, rec);
+      return rec;
+    }
     if (!canvas.parentNode) return null;
 
     const overlay = D.createElement("canvas");
@@ -676,6 +726,7 @@
   }
 
   function syncOverlay(canvas, rec) {
+    if (!ensureOverlayPlacement(canvas, rec)) return false;
     const w = canvas.width | 0;
     const h = canvas.height | 0;
     if (w <= 0 || h <= 0) return false;
@@ -685,7 +736,7 @@
       o.height = h;
       rec.width = w;
       rec.height = h;
-      rec.labels.clear();
+      // Resizing the overlay clears its bitmap, but keep the label records.
       rec.dirty = true;
     }
     let cw = canvas.style.width;
@@ -700,18 +751,24 @@
     return true;
   }
 
+  function markLabelsPending(rec, rect) {
+    if (!rec) return;
+    const now = nowMs();
+    for (const label of rec.labels.values()) {
+      if ((!rect || intersects(label.rect, rect)) && label.pendingSince == null) {
+        label.pendingSince = now;
+      }
+    }
+  }
+
   function clearOverlayRect(canvas, r) {
     if (isOverlayCanvas(canvas)) return;
     const rec = overlayRecords.get(canvas);
     if (!rec) return;
-    visibilityCache.delete(canvas);
-    syncOverlay(canvas, rec);
-    for (const [id, label] of rec.labels) {
-      if (intersects(label.rect, r)) rec.labels.delete(id);
-    }
-    const octx = rec.overlay.getContext("2d");
-    if (octx) octx.clearRect(r.x, r.y, r.w, r.h);
-    rec.dirty = true;
+    // Do not clear the visible overlay immediately. Tenhou often clears and
+    // redraws a tile in separate operations; defer removal until it has stayed
+    // absent for several frames. A redraw at the same position cancels pending.
+    markLabelsPending(rec, r);
   }
 
   function resetCanvas(canvas) {
@@ -719,14 +776,12 @@
     visibilityCache.delete(canvas);
     const rec = overlayRecords.get(canvas);
     if (!rec) return;
-    rec.labels.clear();
+    markLabelsPending(rec, null);
     rec.dirty = true;
-    const octx = rec.overlay.getContext("2d");
-    if (octx) octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
   }
 
   function addTileLabel(key, rawRect, canvas) {
-    if (!canvas || isOverlayCanvas(canvas) || !isVisibleCanvas(canvas)) return;
+    if (!canvas || isOverlayCanvas(canvas)) return;
     const rect = normalizeRect(rawRect);
     if (!rect) return;
     const k = Number(key);
@@ -737,13 +792,14 @@
     if (!name) return;
     const rec = getOverlay(canvas);
     if (!rec) return;
-    const id = (k & 0xffffff) >>> 0;
+    const id = labelPositionId(rect);
     rec.labels.set(id, {
       key: k,
       code,
       name,
       aka: AKA_CODES.has(code),
       rect,
+      pendingSince: null,
     });
     rec.dirty = true;
     tileOverlay.stats.labels++;
@@ -796,18 +852,32 @@
   }
 
   function renderFrame() {
+    const now = nowMs();
     for (const canvas of Array.from(trackedCanvases)) {
       const rec = overlayRecords.get(canvas);
       if (!rec) {
         trackedCanvases.delete(canvas);
         continue;
       }
-      if (!canvas.isConnected || !isVisibleCanvas(canvas)) {
-        rec.labels.clear();
-        const octx = rec.overlay.getContext("2d");
-        if (octx) octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
-        rec.dirty = false;
+
+      for (const [id, label] of rec.labels) {
+        if (label.pendingSince != null && now - label.pendingSince >= CLEAR_GRACE_MS) {
+          rec.labels.delete(id);
+          rec.dirty = true;
+        }
+      }
+
+      if (!canvas.isConnected || !canvas.parentNode || !isVisibleCanvas(canvas)) {
+        if (rec.overlay.style.visibility !== "hidden") {
+          rec.overlay.style.visibility = "hidden";
+        }
+        // Keep label records: hidden canvases are often shown again without a
+        // complete repaint, and destroying these records caused blank overlays.
         continue;
+      }
+      if (rec.overlay.style.visibility === "hidden") {
+        rec.overlay.style.visibility = "visible";
+        rec.dirty = true;
       }
       if (!syncOverlay(canvas, rec)) continue;
       if (!rec.dirty) continue;
@@ -836,7 +906,7 @@
           try {
             if (!img || img.__tenhou4enTileKey == null) return res;
             const canvas = this.canvas;
-            if (!canvas || !isVisibleCanvas(canvas)) return res;
+            if (!canvas) return res;
             const args = Array.prototype.slice.call(arguments, 1);
             const rect = parseDrawArgs(img, args);
             if (!rect) return res;
@@ -863,10 +933,8 @@
           const res = nativeClearRect.apply(this, arguments);
           try {
             const canvas = this.canvas;
-            if (!canvas || isOverlayCanvas(canvas) || !isVisibleCanvas(canvas)) {
-              return res;
-            }
-            const r = normalizeRect({ x, y, w, h });
+            if (!canvas || isOverlayCanvas(canvas)) return res;
+            const r = normalizeClearRect(x, y, w, h);
             if (!r) return res;
             tileOverlay.stats.clears++;
             clearOverlayRect(canvas, r);
@@ -1631,7 +1699,7 @@
   window.__tenhou4en = debugApi;
 
   console.log(
-    "%c[tenhou4-en] v0.3.2 loaded - compact English tile names are always on" +
+    "%c[tenhou4-en] v0.4.1 loaded - compact English tile names are always on" +
     (IS_DESKTOP4K ? "" : " (tile overlay: /4 only)"),
     "color:#0a0;font-weight:bold"
   );
