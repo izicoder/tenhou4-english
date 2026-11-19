@@ -189,6 +189,11 @@ test("translates generated table names", () => {
        <div id="a">四鳳南喰赤</div>
        <div id="b">三鳳南喰赤</div>
        <div id="c">四特東喰赤速</div>
+       <div id="d">四般東喰赤速</div>
+       <div id="e">三般東喰赤</div>
+       <div id="f">四若東速祝５</div>
+       <div id="g">四般東断</div>
+       <div id="h">四般東喰赤光</div>
      </body>`,
     "https://tenhou.net/4/"
   );
@@ -197,6 +202,11 @@ test("translates generated table names", () => {
   assert.equal(d.getElementById("a").textContent, "4P Phoenix South Open Red");
   assert.equal(d.getElementById("b").textContent, "3P Phoenix South Open Red");
   assert.equal(d.getElementById("c").textContent, "4P Expert East Open Red Fast");
+  assert.equal(d.getElementById("d").textContent, "4P General East Open Red Fast");
+  assert.equal(d.getElementById("e").textContent, "3P General East Open Red");
+  assert.equal(d.getElementById("f").textContent, "4P Wakaba East Fast Anniv 5");
+  assert.equal(d.getElementById("g").textContent, "4P General East No Open");
+  assert.equal(d.getElementById("h").textContent, "4P General East Open Red Flash");
 
   dom.window.close();
 });
@@ -312,6 +322,40 @@ test("updates the nopp round when the digit span changes", async () => {
 test("translates the game-start label", () => {
   const dom = load(`<body><div id="g">對局</div></body>`, "https://tenhou.net/4/");
   assert.equal(dom.window.document.getElementById("g").textContent, "Game");
+  dom.window.close();
+});
+
+test("translates game-select list rows and room notes", () => {
+  const dom = load(
+    `<body>
+       <div id="a">四般東喰赤　  2:</div>
+       <div id="b">四琥東速祝０</div>
+       <div id="c">※四麻上級卓</div>
+       <div id="d">※三麻雀荘戦</div>
+       <div id="e">※喰断ナシON/OFF</div>
+     </body>`,
+    "https://tenhou.net/4/"
+  );
+
+  const d = dom.window.document;
+  assert.equal(d.getElementById("a").textContent, "4P General East Open Red  2:");
+  assert.equal(d.getElementById("b").textContent, "4P Amber East Fast Anniv 0");
+  assert.equal(d.getElementById("c").textContent, "* 4P Advanced table");
+  assert.equal(d.getElementById("d").textContent, "* 3P Jansou match");
+  assert.equal(d.getElementById("e").textContent, "* Kuitan Nashi ON/OFF");
+
+  dom.window.close();
+});
+
+test("translates the lobby outage notice", () => {
+  const dom = load(
+    `<body><div id="n">10/21,11/08に発生した障害の戦績修正を受け付けています</div></body>`,
+    "https://tenhou.net/4/"
+  );
+  assert.equal(
+    dom.window.document.getElementById("n").textContent,
+    "Accepting results corrections for the 10/21 and 11/08 outages"
+  );
   dom.window.close();
 });
 
