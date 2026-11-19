@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English + Compact Tile Names
 // @name:ja      天鳳 /4 英語化 + 英語牌名
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.3.0
+// @version      0.3.1
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K) and draws always-on compact English tile names over every face-up tile.
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -102,11 +102,17 @@
     errors: [],
     snippets: {},
     blobUrl: "",
+    scanned: 0,
+    replaced: 0,
+    alreadyLoaded: false,
+    reloadWarned: false,
+    insertionHooks: false,
+    observer: false,
     disabledReason: IS_DESKTOP4K ? "" : "not a /4/ page",
   };
 
   const tileOverlay = {
-    version: "0.3.0",
+    version: "0.3.1",
     mode: "compact",
     scope: "all face-up tiles",
     enabled: true,
@@ -344,6 +350,154 @@
     return clientHook.patched && clientHook.blobUrl
       ? clientHook.blobUrl
       : raw;
+  }
+
+  function resourceAlreadyLoaded(raw) {
+    try {
+      const full = new W.URL(raw, W.location.href).href;
+      const perf = W.performance;
+      if (perf && perf.getEntriesByType) {
+        const entries = perf.getEntriesByType("resource");
+        for (const e of entries) {
+          if (e.name === full && e.responseEnd > 0) return true;
+        }
+      }
+    } catch (e) { }
+    return false;
+  }
+
+  function patchExistingScript(script) {
+    if (!script || script.__tenhou4enPatched) return false;
+    const tag = script.tagName ? script.tagName.toUpperCase() : "";
+    if (tag !== "SCRIPT") return false;
+    const raw = script.getAttribute("src") || script.src || "";
+    if (!raw || !isClientScriptUrl(raw)) return false;
+
+    const loaded =
+      script.dataset.tenhou4enLoaded === "1" ||
+      script.readyState === "complete" ||
+      script.readyState === "loaded" ||
+      resourceAlreadyLoaded(raw);
+    if (loaded) {
+      clientHook.alreadyLoaded = true;
+      clientHook.disabledReason = "client script already loaded; reload required";
+      if (!clientHook.reloadWarned) {
+        clientHook.reloadWarned = true;
+        pushClientError(
+          "client script was already loaded before the hooks were installed; reload the page with the userscript enabled"
+        );
+        if (DEBUG) {
+          W.console.warn(
+            "[tenhou4-en] tile overlay: /4/latest.js already loaded; please reload once"
+          );
+        }
+      }
+      return false;
+    }
+
+    const patchedUrl = resolveClientUrl(raw);
+    if (!clientHook.patched || patchedUrl === raw) return false;
+    script.__tenhou4enPatched = true;
+    script.dataset.tenhou4enPatched = "1";
+    script.addEventListener(
+      "load",
+      () => {
+        script.dataset.tenhou4enLoaded = "1";
+      },
+      { once: true }
+    );
+    // setAttribute works even when the src property setter lives in another
+    // DOM wrapper world; resolveClientUrl() leaves Blob/data URLs untouched.
+    script.setAttribute("src", patchedUrl);
+    clientHook.replaced++;
+    if (DEBUG) {
+      W.console.log(
+        "[tenhou4-en] rewrote pending /4/latest.js to patched Blob URL"
+      );
+    }
+    return true;
+  }
+
+  function patchScriptTree(node) {
+    if (!node) return 0;
+    if (node.nodeType === 1) {
+      const tag = node.tagName ? node.tagName.toUpperCase() : "";
+      if (tag === "SCRIPT") return patchExistingScript(node) ? 1 : 0;
+    }
+    if (node.nodeType === 1 || node.nodeType === 11) {
+      let count = 0;
+      const kids = node.childNodes;
+      for (let i = 0; i < kids.length; i++) count += patchScriptTree(kids[i]);
+      return count;
+    }
+    return 0;
+  }
+
+  function scanExistingClientScripts() {
+    clientHook.scanned++;
+    const scripts = D.getElementsByTagName("script");
+    for (let i = 0; i < scripts.length; i++) patchExistingScript(scripts[i]);
+  }
+
+  function installInsertionHooks() {
+    const nodeProto = W.Node && W.Node.prototype;
+    if (!nodeProto) {
+      pushClientError("Node.prototype unavailable for insertion hooks");
+      return;
+    }
+    let ok = false;
+    for (const method of ["appendChild", "insertBefore"]) {
+      const desc = Object.getOwnPropertyDescriptor(nodeProto, method);
+      if (!desc || !desc.value || !desc.configurable) {
+        pushClientError(method + " descriptor unavailable");
+        continue;
+      }
+      const nativeMethod = desc.value;
+      Object.defineProperty(nodeProto, method, {
+        configurable: true,
+        enumerable: desc.enumerable,
+        writable: true,
+        value: function (node) {
+          try {
+            patchScriptTree(node);
+          } catch (e) {
+            recordError(e);
+          }
+          return nativeMethod.apply(this, arguments);
+        },
+      });
+      ok = true;
+    }
+    clientHook.insertionHooks = ok;
+  }
+
+  function installClientObserver() {
+    if (!W.MutationObserver) {
+      pushClientError("MutationObserver unavailable");
+      return;
+    }
+    try {
+      const mo = new W.MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const n of m.addedNodes) patchScriptTree(n);
+        }
+      });
+      mo.observe(D, { childList: true, subtree: true });
+      clientHook.observer = true;
+    } catch (e) {
+      pushClientError("MutationObserver failed: " + ((e && e.message) || e));
+      recordError(e);
+    }
+  }
+
+  function scheduleScans() {
+    scanExistingClientScripts();
+    W.setTimeout(scanExistingClientScripts, 0);
+    W.setTimeout(scanExistingClientScripts, 50);
+    W.setTimeout(scanExistingClientScripts, 250);
+    D.addEventListener("DOMContentLoaded", scanExistingClientScripts, {
+      once: true,
+    });
   }
 
   function normalizeRect(r) {
@@ -746,6 +900,9 @@
     }
     installCanvasHooks();
     installScriptHooks();
+    installInsertionHooks();
+    installClientObserver();
+    scheduleScans();
     raf(renderFrame);
     if (DEBUG) {
       W.console.log(
@@ -1408,7 +1565,7 @@
   window.__tenhou4en = debugApi;
 
   console.log(
-    "%c[tenhou4-en] v0.3.0 loaded - compact English tile names are always on" +
+    "%c[tenhou4-en] v0.3.1 loaded - compact English tile names are always on" +
     (IS_DESKTOP4K ? "" : " (tile overlay: /4 only)"),
     "color:#0a0;font-weight:bold"
   );
