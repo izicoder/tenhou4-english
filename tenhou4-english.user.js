@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Tenhou /4 English + Compact Tile Names
-// @name:ja      天鳳 /4 英語化 + 英語牌名
+// @name         Tenhou /4 English (full)
+// @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.4.1
-// @description  Completes the English UI on tenhou.net/4 (Desktop4K) and draws always-on compact English tile names over every face-up tile.
+// @version      0.5.0
+// @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
 // @author       you
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
@@ -20,1049 +20,83 @@
 /*
  * How this works
  * --------------
- * 1. String-table patch (official EN JSON)
- * 2. MutationObserver for hard-coded Japanese strings
- * 3. Compact English tile-name overlay (always on)
+ * The /4 client keeps its UI strings in a per-language table loaded from
+ *   https://cdn.tenhou.net/4/res/lang/string<date>_<lang>.json
+ * and looks them up as  hb[lang][id] || hb.en[id] || hb.ja[id].
  *
- * Tenhou /4 draws tiles on canvases, not DOM tiles. At document-start this
- * script fetches /4/latest.js, injects two tiny hooks into its minified
- * tile-canvas factories, and loads the patched client from a Blob URL. It then
- * wraps CanvasRenderingContext2D.drawImage / clearRect and the canvas width /
- * height setters so transparent overlay canvases stay in sync with every
- * visible game canvas.
+ * The official EN table is missing a few ids and leaves a few values in
+ * Japanese.  We intercept the XHR for the EN table and merge our overrides
+ * in, so the client itself renders English everywhere the table is used.
  *
- * Labels are permanent: no hotkey, no localStorage on/off switch. Face-down
- * tile backs are skipped. Red fives get a red badge. The overlay tracks labels
- * by canvas position, tolerates short clear/redraw gaps, and reattaches if the
- * game rebuilds or moves its canvas DOM.
+ * Everything else (yaku names, ranks, room names, counters) is hard-coded
+ * Japanese inside latest.js and written into the DOM, so a MutationObserver
+ * swaps those text nodes by exact match.
  *
- * Debug / verification:
- *   add ?tenhou_en_debug=1 to the URL (or localStorage.tenhou4enDebug = "1")
- *   then run:  __tenhou4en.tileOverlay.dump()
- * If Tenhou ships a new minified client and a patch point moves, the dump
- * includes the exact snippets needed to update the replacements below.
+ * Tile labels: tiles are canvas sprites decoded on demand from obj*.dat files.
+ * We watch Zlib.Inflate to learn which face a sprite is being decoded for and
+ * draw the label onto the sprite canvas right after putImageData().  No
+ * client patching, no extra canvases.  Console helpers:
+ *   __tenhou4en.tiles.stats()            counters, to see if it is working
+ *   __tenhou4en.tiles.setPosition("c")   centre the labels (reload after)
+ *   __tenhou4en.tiles.setOffset(dx, dy)  nudge, fractions of the tile face
+ *   __tenhou4en.tiles.setEnabled(false)  turn the labels off
+ *
+ * Only run ONE copy of this script: another Tenhou /4 userscript (anything
+ * that sets window.__tenhou4enInstalled) will make the second one bow out.
  */
 
 (function () {
   "use strict";
 
-  const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-  if (W.__tenhou4enInstalled) return;
-  W.__tenhou4enInstalled = true;
+  const VERSION = "0.5.0";
+  if (window.__tenhou4enInstalled) {
+    console.warn(
+      "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
+      "already running.  Disable the duplicate userscript and reload."
+    );
+    return;
+  }
   window.__tenhou4enInstalled = true;
 
-  const D = W.document;
-
   const DEBUG =
-    /[?&]tenhou_en_debug=1\b/.test(W.location.search) ||
+    /[?&]tenhou_en_debug=1\b/.test(location.search) ||
     (() => {
       try {
-        return W.localStorage.getItem("tenhou4enDebug") === "1";
+        return localStorage.getItem("tenhou4enDebug") === "1";
       } catch (e) {
         return false;
       }
     })();
 
-  const IS_DESKTOP4K = /^\/4\//.test(W.location.pathname);
-
-  // ===================================================================
-  // COMPACT ENGLISH TILE NAMES  (always on)
-  // ===================================================================
-
-  const TILE_LABELS = {
-    0: "5m", 10: "5p", 20: "5s",       // red fives (aka)
-    1: "1m", 2: "2m", 3: "3m", 4: "4m", 5: "5m", 6: "6m", 7: "7m", 8: "8m", 9: "9m",
-    11: "1p", 12: "2p", 13: "3p", 14: "4p", 15: "5p", 16: "6p", 17: "7p", 18: "8p", 19: "9p",
-    21: "1s", 22: "2s", 23: "3s", 24: "4s", 25: "5s", 26: "6s", 27: "7s", 28: "8s", 29: "9s",
-    30: "E", 31: "S", 32: "W", 33: "N",
-    34: "Haku", 35: "Hatsu", 36: "Chun",
-  };
-  const AKA_CODES = new Set([0, 10, 20]);
-  const SKIP_CODES = new Set([37, 255]); // tile back / unknown
-  // Keep labels through a short clear/redraw gap to avoid one-frame flicker.
-  const CLEAR_GRACE_MS = 96;
-
-  const CRC2D = W.CanvasRenderingContext2D;
-  const HCE = W.HTMLCanvasElement;
-  const HSE = W.HTMLScriptElement;
-  const ELEM = W.Element;
-  const CAN_HOOK = !!(CRC2D && HCE && HSE && ELEM);
-
-  const trackedCanvases = new Set();
-  const visibilityCache = new WeakMap();
-  const overlayRecords = new WeakMap();
-  const raf = W.requestAnimationFrame
-    ? W.requestAnimationFrame.bind(W)
-    : (cb) => W.setTimeout(cb, 16);
-
-  const clientHook = {
-    attempted: false,
-    patched: false,
-    requestUrl: "",
-    finalUrl: "",
-    codeLength: 0,
-    patchedLength: 0,
-    applied: [],
-    errors: [],
-    snippets: {},
-    blobUrl: "",
-    scanned: 0,
-    replaced: 0,
-    alreadyLoaded: false,
-    reloadWarned: false,
-    insertionHooks: false,
-    observer: false,
-    styleObserver: false,
-    styleInvalidations: 0,
-    disabledReason: IS_DESKTOP4K ? "" : "not a /4/ page",
-  };
-
-  const tileOverlay = {
-    version: "0.4.1",
-    mode: "compact",
-    scope: "all face-up tiles",
-    enabled: true,
-    toggle: false,
-    hotkey: null,
-    labels: TILE_LABELS,
-    aka: Array.from(AKA_CODES),
-    stats: { draws: 0, labels: 0, clears: 0, overlays: 0, errors: [] },
-    dump() {
-      const overlays = [];
-      for (const c of Array.from(trackedCanvases)) {
-        const rec = overlayRecords.get(c);
-        if (!rec) continue;
-        overlays.push({
-          canvas: {
-            tagName: c.tagName,
-            className: c.className || "",
-            width: c.width,
-            height: c.height,
-            connected: !!c.isConnected,
-            overlayConnected: !!rec.overlay.isConnected,
-          },
-          labelCount: rec.labels.size,
-          sample: Array.from(rec.labels.values()).slice(0, 8).map((l) => ({
-            code: l.code,
-            name: l.name,
-            aka: l.aka,
-            pendingClear: l.pendingSince != null,
-            x: Math.round(l.rect.x),
-            y: Math.round(l.rect.y),
-            w: Math.round(l.rect.w),
-            h: Math.round(l.rect.h),
-          })),
-        });
-      }
-      return {
-        version: this.version,
-        mode: this.mode,
-        scope: this.scope,
-        enabled: this.enabled,
-        desktop4k: IS_DESKTOP4K,
-        canHook: CAN_HOOK,
-        debug: DEBUG,
-        client: JSON.parse(JSON.stringify(clientHook)),
-        stats: Object.assign({}, this.stats, { errors: this.stats.errors.slice() }),
-        overlays,
-      };
-    },
-    report() {
-      return JSON.stringify(this.dump(), null, 2);
-    },
-    forceRedraw() {
-      for (const c of Array.from(trackedCanvases)) {
-        const rec = overlayRecords.get(c);
-        if (rec) rec.dirty = true;
-      }
-      return true;
-    },
-  };
-
-  function pushClientError(msg) {
-    if (clientHook.errors.length < 20) clientHook.errors.push(String(msg));
-  }
-
-  function recordError(e) {
-    const msg = (e && (e.stack || e.message)) || String(e);
-    if (tileOverlay.stats.errors.length < 20) tileOverlay.stats.errors.push(msg);
-    if (DEBUG) W.console.warn("[tenhou4-en] tile overlay error:", e);
-  }
-
-  function isOverlayCanvas(canvas) {
-    return !!(
-      canvas &&
-      canvas.classList &&
-      canvas.classList.contains("tenhou4en-tile-overlay")
-    );
-  }
-
-  function isClientScriptUrl(value) {
-    try {
-      return new W.URL(String(value), W.location.href).pathname === "/4/latest.js";
-    } catch (e) {
-      return /\/4\/latest\.js(?:\?|$)/.test(String(value));
-    }
-  }
-
-  function snippet(code, needle) {
-    const i = code.indexOf(needle);
-    if (i < 0) return null;
-    return code.slice(
-      Math.max(0, i - 140),
-      Math.min(code.length, i + needle.length + 180)
-    );
-  }
-
-  function patchClientScript(code) {
-    const applied = [];
-    const errors = [];
-    const snippets = {};
-
-    function exact(from, to, label) {
-      const i = code.indexOf(from);
-      if (i < 0) {
-        errors.push("missing " + label);
-        snippets[label] = snippet(code, from);
-        return false;
-      }
-      code = code.replace(from, to);
-      applied.push(label);
-      return true;
-    }
-
-    const gFrom = ";return p}function e(h,a,n,p,q){";
-    const gTo =
-      ";p.ea.canvas.__tenhou4enTileKey=h;return p}function e(h,a,n,p,q){";
-    if (!exact(gFrom, gTo, "g-canvas")) {
-      const re =
-        /function\s+g\(h,a\)\{[\s\S]*?return p\}\s*function\s+e\(h,a,n,p,q\)\{/;
-      const m = re.exec(code);
-      if (m) {
-        const injected = m[0].replace(
-          "return p}",
-          "p.ea.canvas.__tenhou4enTileKey=h;return p}"
-        );
-        code =
-          code.slice(0, m.index) +
-          injected +
-          code.slice(m.index + m[0].length);
-        applied.push("g-canvas-regex");
-      } else {
-        errors.push("g-canvas regex did not match");
-        snippets["g-function"] = snippet(code, "function g(h,a){");
-      }
-    }
-
-    const eFrom = "f(r,Ac.zb(a,0));return{ea:r,s:a.s,da:q}";
-    const eTo =
-      "f(r,Ac.zb(a,0));r.canvas.__tenhou4enTileKey=a.oa;return{ea:r,s:a.s,da:q}";
-    if (!exact(eFrom, eTo, "e-canvas")) {
-      const re =
-        /function\s+e\(h,a,n,p,q\)\{[\s\S]*?return\{ea:r,s:a\.s,da:q\}\}/;
-      const m = re.exec(code);
-      if (m) {
-        const injected = m[0].replace(
-          "return{ea:r,s:a.s,da:q}",
-          "r.canvas.__tenhou4enTileKey=a.oa;return{ea:r,s:a.s,da:q}"
-        );
-        code =
-          code.slice(0, m.index) +
-          injected +
-          code.slice(m.index + m[0].length);
-        applied.push("e-canvas-regex");
-      } else {
-        errors.push("e-canvas regex did not match");
-        snippets["e-function"] = snippet(code, "function e(h,a,n,p,q){");
-      }
-    }
-
-    // Fallback for the main board when the g() cache hook could not be applied.
-    if (!applied.some((a) => a.indexOf("g-canvas") === 0)) {
-      const aaFrom =
-        "a.drawImage(m[n].ea.canvas,x.x-u,x.y-v,x.w,x.i,x.x,x.y,x.w,x.i),++wc.gg";
-      const aaTo =
-        "window.__tenhou4enTileDraw&&window.__tenhou4enTileDraw(p.c.oa,{x:x.x,y:x.y,w:x.w,i:x.i},a.canvas)," +
-        aaFrom;
-      exact(aaFrom, aaTo, "aa-draw");
-    }
-
-    if (applied.length) {
-      code += "\n/* tenhou4-en tile hooks: " + applied.join(", ") + " */\n";
-    }
-    return { ok: applied.length > 0, code, applied, errors, snippets };
-  }
-
-  function fetchAndPatch(rawUrl) {
-    const url = new W.URL(String(rawUrl), W.location.href).href;
-    clientHook.requestUrl = url;
-    clientHook.attempted = true;
-    let code;
-    try {
-      const xhr = new W.XMLHttpRequest();
-      xhr.open("GET", url, false);
-      if (xhr.overrideMimeType) xhr.overrideMimeType("text/plain; charset=utf-8");
-      xhr.send(null);
-      if (xhr.status < 200 || xhr.status >= 300) {
-        throw new Error("HTTP " + xhr.status);
-      }
-      code = xhr.responseText;
-      clientHook.finalUrl = xhr.responseURL || url;
-      clientHook.codeLength = code.length;
-    } catch (e) {
-      pushClientError("fetch failed: " + ((e && e.message) || e));
-      recordError(e);
-      return false;
-    }
-
-    const result = patchClientScript(code);
-    clientHook.applied = result.applied.slice();
-    for (const msg of result.errors) pushClientError(msg);
-    clientHook.snippets = result.snippets;
-    clientHook.patchedLength = result.code.length;
-
-    if (!result.ok) {
-      pushClientError("no tile patch points matched; client script left unpatched");
-      if (DEBUG) W.console.warn("[tenhou4-en] tile overlay patch failed", result);
-      return false;
-    }
-
-    let blobUrl = "";
-    try {
-      const blob = new W.Blob([result.code], {
-        type: "text/javascript;charset=utf-8",
-      });
-      blobUrl = W.URL.createObjectURL(blob);
-    } catch (e) {
-      blobUrl =
-        "data:text/javascript;charset=utf-8," + encodeURIComponent(result.code);
-      pushClientError("Blob URL unavailable, used data URL: " + ((e && e.message) || e));
-    }
-    clientHook.blobUrl = blobUrl;
-    clientHook.patched = true;
-    if (DEBUG) {
-      W.console.log(
-        "%c[tenhou4-en] tile hooks applied:",
-        "color:#0a0;font-weight:bold",
-        result.applied.join(", "),
-        clientHook.finalUrl
-      );
-    }
-    return true;
-  }
-
-  function resolveClientUrl(value) {
-    const raw = String(value);
-    if (!isClientScriptUrl(raw)) return raw;
-    if (!clientHook.attempted) fetchAndPatch(raw);
-    return clientHook.patched && clientHook.blobUrl
-      ? clientHook.blobUrl
-      : raw;
-  }
-
-  function resourceAlreadyLoaded(raw) {
-    try {
-      const full = new W.URL(raw, W.location.href).href;
-      const perf = W.performance;
-      if (perf && perf.getEntriesByType) {
-        const entries = perf.getEntriesByType("resource");
-        for (const e of entries) {
-          if (e.name === full && e.responseEnd > 0) return true;
-        }
-      }
-    } catch (e) { }
-    return false;
-  }
-
-  function patchExistingScript(script) {
-    if (!script || script.__tenhou4enPatched) return false;
-    const tag = script.tagName ? script.tagName.toUpperCase() : "";
-    if (tag !== "SCRIPT") return false;
-    const raw = script.getAttribute("src") || script.src || "";
-    if (!raw || !isClientScriptUrl(raw)) return false;
-
-    const loaded =
-      script.dataset.tenhou4enLoaded === "1" ||
-      script.readyState === "complete" ||
-      script.readyState === "loaded" ||
-      resourceAlreadyLoaded(raw);
-    if (loaded) {
-      clientHook.alreadyLoaded = true;
-      clientHook.disabledReason = "client script already loaded; reload required";
-      if (!clientHook.reloadWarned) {
-        clientHook.reloadWarned = true;
-        pushClientError(
-          "client script was already loaded before the hooks were installed; reload the page with the userscript enabled"
-        );
-        if (DEBUG) {
-          W.console.warn(
-            "[tenhou4-en] tile overlay: /4/latest.js already loaded; please reload once"
-          );
-        }
-      }
-      return false;
-    }
-
-    const patchedUrl = resolveClientUrl(raw);
-    if (!clientHook.patched || patchedUrl === raw) return false;
-    script.__tenhou4enPatched = true;
-    script.dataset.tenhou4enPatched = "1";
-    script.addEventListener(
-      "load",
-      () => {
-        script.dataset.tenhou4enLoaded = "1";
-      },
-      { once: true }
-    );
-    // setAttribute works even when the src property setter lives in another
-    // DOM wrapper world; resolveClientUrl() leaves Blob/data URLs untouched.
-    script.setAttribute("src", patchedUrl);
-    clientHook.replaced++;
-    if (DEBUG) {
-      W.console.log(
-        "[tenhou4-en] rewrote pending /4/latest.js to patched Blob URL"
-      );
-    }
-    return true;
-  }
-
-  function patchScriptTree(node) {
-    if (!node) return 0;
-    if (node.nodeType === 1) {
-      const tag = node.tagName ? node.tagName.toUpperCase() : "";
-      if (tag === "SCRIPT") return patchExistingScript(node) ? 1 : 0;
-    }
-    if (node.nodeType === 1 || node.nodeType === 11) {
-      let count = 0;
-      const kids = node.childNodes;
-      for (let i = 0; i < kids.length; i++) count += patchScriptTree(kids[i]);
-      return count;
-    }
-    return 0;
-  }
-
-  function scanExistingClientScripts() {
-    clientHook.scanned++;
-    const scripts = D.getElementsByTagName("script");
-    for (let i = 0; i < scripts.length; i++) patchExistingScript(scripts[i]);
-  }
-
-  function ensureOverlayForCanvas(canvas) {
-    if (!canvas || isOverlayCanvas(canvas)) return false;
-    if (canvas.tagName !== "CANVAS") return false;
-    if (!(canvas.width > 100 && canvas.height > 100)) return false;
-    if (!canvas.parentNode) return false;
-    getOverlay(canvas); // also repairs a detached or misplaced overlay
-    visibilityCache.delete(canvas);
-    return true;
-  }
-
-  function ensureOverlayForTree(node) {
-    if (!node) return 0;
-    if (node.nodeType === 1 && node.tagName === "CANVAS") {
-      return ensureOverlayForCanvas(node) ? 1 : 0;
-    }
-    if (node.nodeType === 1 || node.nodeType === 9 || node.nodeType === 11) {
-      let count = 0;
-      const kids = node.childNodes;
-      for (let i = 0; i < kids.length; i++) count += ensureOverlayForTree(kids[i]);
-      return count;
-    }
-    return 0;
-  }
-
-  function installInsertionHooks() {
-    const nodeProto = W.Node && W.Node.prototype;
-    if (!nodeProto) {
-      pushClientError("Node.prototype unavailable for insertion hooks");
-      return;
-    }
-    let ok = false;
-    for (const method of ["appendChild", "insertBefore"]) {
-      const desc = Object.getOwnPropertyDescriptor(nodeProto, method);
-      if (!desc || !desc.value || !desc.configurable) {
-        pushClientError(method + " descriptor unavailable");
-        continue;
-      }
-      const nativeMethod = desc.value;
-      Object.defineProperty(nodeProto, method, {
-        configurable: true,
-        enumerable: desc.enumerable,
-        writable: true,
-        value: function (node) {
-          try {
-            patchScriptTree(node);
-          } catch (e) {
-            recordError(e);
-          }
-          return nativeMethod.apply(this, arguments);
-        },
-      });
-      ok = true;
-    }
-    clientHook.insertionHooks = ok;
-  }
-
-  function installClientObserver() {
-    if (!W.MutationObserver) {
-      pushClientError("MutationObserver unavailable");
-      return;
-    }
-    try {
-      const mo = new W.MutationObserver((muts) => {
-        for (const m of muts) {
-          for (const n of m.addedNodes) {
-            patchScriptTree(n);
-            ensureOverlayForTree(n);
-            if (n.nodeType === 1 && n.tagName === "CANVAS") {
-              visibilityCache.delete(n);
-            }
-          }
-        }
-      });
-      mo.observe(D, { childList: true, subtree: true });
-      clientHook.observer = true;
-    } catch (e) {
-      pushClientError("MutationObserver failed: " + ((e && e.message) || e));
-      recordError(e);
-    }
-  }
-
-  function scanAll() {
-    scanExistingClientScripts();
-    ensureOverlayForTree(D.documentElement || D);
-  }
-
-  function installStyleObserver() {
-    if (!W.MutationObserver) {
-      pushClientError("MutationObserver unavailable for style observer");
-      return;
-    }
-    try {
-      const mo = new W.MutationObserver((muts) => {
-        for (const m of muts) {
-          const t = m.target;
-          if (t && t.tagName === "CANVAS") {
-            visibilityCache.delete(t);
-            const rec = overlayRecords.get(t);
-            if (rec) rec.dirty = true;
-            clientHook.styleInvalidations++;
-          }
-        }
-      });
-      mo.observe(D, {
-        attributes: true,
-        attributeFilter: ["style", "class"],
-        subtree: true,
-      });
-      clientHook.styleObserver = true;
-    } catch (e) {
-      pushClientError("style observer failed: " + ((e && e.message) || e));
-      recordError(e);
-    }
-  }
-
-  function scheduleScans() {
-    scanAll();
-    W.setTimeout(scanAll, 0);
-    W.setTimeout(scanAll, 50);
-    W.setTimeout(scanAll, 250);
-    D.addEventListener("DOMContentLoaded", scanAll, { once: true });
-  }
-
-  function normalizeRect(r) {
-    if (!r) return null;
-    const x = Number(r.x);
-    const y = Number(r.y);
-    const w = Number(r.w != null ? r.w : r.width);
-    const hRaw = r.h != null ? r.h : r.i != null ? r.i : r.height;
-    const h = Number(hRaw);
-    if (![x, y, w, h].every((v) => Number.isFinite(v))) return null;
-    if (w <= 0 || h <= 0) return null;
-    return { x, y, w, h };
-  }
-
-  function intersects(a, b) {
-    return (
-      a.x < b.x + b.w &&
-      a.x + a.w > b.x &&
-      a.y < b.y + b.h &&
-      a.y + a.h > b.y
-    );
-  }
-
-  function normalizeClearRect(x, y, w, h) {
-    x = Number(x);
-    y = Number(y);
-    w = Number(w);
-    h = Number(h);
-    if (![x, y, w, h].every((v) => Number.isFinite(v)) || w === 0 || h === 0) {
-      return null;
-    }
-    return {
-      x: Math.min(x, x + w),
-      y: Math.min(y, y + h),
-      w: Math.abs(w),
-      h: Math.abs(h),
-    };
-  }
-
-  // The source canvas key identifies a tile image/type, not necessarily one
-  // board occurrence. Position-based IDs let duplicate tiles coexist.
-  function labelPositionId(rect) {
-    const q = (v) => Math.round(v); // tolerate subpixel jitter during animation
-    return q(rect.x) + ":" + q(rect.y);
-  }
-
-  function nowMs() {
-    try {
-      if (W.performance && typeof W.performance.now === "function") {
-        return W.performance.now();
-      }
-    } catch (e) { }
-    return Date.now();
-  }
-
-  function parseDrawArgs(img, args) {
-    const n = args.length;
-    const iw = Number(img && (img.width || img.naturalWidth)) || 0;
-    const ih = Number(img && (img.height || img.naturalHeight)) || 0;
-    if (n >= 8) {
-      const sx = Number(args[0]), sy = Number(args[1]);
-      const sw = Number(args[2]), sh = Number(args[3]);
-      const dx = Number(args[4]), dy = Number(args[5]);
-      const dw = Number(args[6]), dh = Number(args[7]);
-      if (![sx, sy, sw, sh, dx, dy, dw, dh].every((v) => Number.isFinite(v))) {
-        return null;
-      }
-      if (sw <= 0 || sh <= 0) return null;
-      const scaleX = dw / sw;
-      const scaleY = dh / sh;
-      return normalizeRect({
-        x: dx - sx * scaleX,
-        y: dy - sy * scaleY,
-        w: (iw || sw) * scaleX,
-        h: (ih || sh) * scaleY,
-      });
-    }
-    if (n >= 4) {
-      return normalizeRect({ x: args[0], y: args[1], w: args[2], h: args[3] });
-    }
-    if (n >= 2) {
-      return normalizeRect({ x: args[0], y: args[1], w: iw, h: ih });
-    }
-    return null;
-  }
-
-  function isVisibleCanvas(canvas) {
-    if (!canvas || canvas.isConnected === false || isOverlayCanvas(canvas)) {
-      return false;
-    }
-    if (!(canvas.width > 0 && canvas.height > 0)) return false;
-    const now = Date.now();
-    const cached = visibilityCache.get(canvas);
-    if (cached && now - cached.ts < 16) return cached.value;
-    let visible = true;
-    try {
-      if (canvas.getClientRects && canvas.getClientRects().length === 0) {
-        visible = false;
-      }
-      const cs = W.getComputedStyle(canvas);
-      if (cs.display === "none" || cs.visibility === "hidden") visible = false;
-    } catch (e) {
-      visible = false;
-    }
-    visibilityCache.set(canvas, { value: visible, ts: now });
-    return visible;
-  }
-
-  function ensureOverlayPlacement(canvas, rec) {
-    const parent = canvas && canvas.parentNode;
-    if (!parent || !rec || !rec.overlay) return false;
-    if (rec.overlay.parentNode !== parent || canvas.nextSibling !== rec.overlay) {
-      parent.insertBefore(rec.overlay, canvas.nextSibling);
-    }
-    return true;
-  }
-
-  function getOverlay(canvas) {
-    let rec = overlayRecords.get(canvas);
-    if (rec) {
-      ensureOverlayPlacement(canvas, rec);
-      return rec;
-    }
-    if (!canvas.parentNode) return null;
-
-    const overlay = D.createElement("canvas");
-    overlay.className = "tenhou4en-tile-overlay";
-    overlay.setAttribute("aria-hidden", "true");
-    const s = overlay.style;
-    s.position = "absolute";
-    s.left = "0";
-    s.top = "0";
-    s.pointerEvents = "none";
-    let cw = canvas.style.width;
-    let ch = canvas.style.height;
-    try {
-      const cs = W.getComputedStyle(canvas);
-      if (!cw) cw = cs.width;
-      if (!ch) ch = cs.height;
-    } catch (e) { }
-    s.width = cw || "100%";
-    s.height = ch || "100%";
-    canvas.parentNode.insertBefore(overlay, canvas.nextSibling);
-
-    rec = {
-      overlay,
-      labels: new Map(),
-      width: 0,
-      height: 0,
-      dirty: true,
-    };
-    overlayRecords.set(canvas, rec);
-    trackedCanvases.add(canvas);
-    tileOverlay.stats.overlays++;
-    return rec;
-  }
-
-  function syncOverlay(canvas, rec) {
-    if (!ensureOverlayPlacement(canvas, rec)) return false;
-    const w = canvas.width | 0;
-    const h = canvas.height | 0;
-    if (w <= 0 || h <= 0) return false;
-    const o = rec.overlay;
-    if (o.width !== w || o.height !== h) {
-      o.width = w;
-      o.height = h;
-      rec.width = w;
-      rec.height = h;
-      // Resizing the overlay clears its bitmap, but keep the label records.
-      rec.dirty = true;
-    }
-    let cw = canvas.style.width;
-    let ch = canvas.style.height;
-    try {
-      const cs = W.getComputedStyle(canvas);
-      if (!cw) cw = cs.width;
-      if (!ch) ch = cs.height;
-    } catch (e) { }
-    if (cw && o.style.width !== cw) o.style.width = cw;
-    if (ch && o.style.height !== ch) o.style.height = ch;
-    return true;
-  }
-
-  function markLabelsPending(rec, rect) {
-    if (!rec) return;
-    const now = nowMs();
-    for (const label of rec.labels.values()) {
-      if ((!rect || intersects(label.rect, rect)) && label.pendingSince == null) {
-        label.pendingSince = now;
-      }
-    }
-  }
-
-  function clearOverlayRect(canvas, r) {
-    if (isOverlayCanvas(canvas)) return;
-    const rec = overlayRecords.get(canvas);
-    if (!rec) return;
-    // Do not clear the visible overlay immediately. Tenhou often clears and
-    // redraws a tile in separate operations; defer removal until it has stayed
-    // absent for several frames. A redraw at the same position cancels pending.
-    markLabelsPending(rec, r);
-  }
-
-  function resetCanvas(canvas) {
-    if (isOverlayCanvas(canvas)) return;
-    visibilityCache.delete(canvas);
-    const rec = overlayRecords.get(canvas);
-    if (!rec) return;
-    markLabelsPending(rec, null);
-    rec.dirty = true;
-  }
-
-  function addTileLabel(key, rawRect, canvas) {
-    if (!canvas || isOverlayCanvas(canvas)) return;
-    const rect = normalizeRect(rawRect);
-    if (!rect) return;
-    const k = Number(key);
-    if (!Number.isFinite(k)) return;
-    const code = (k >>> 16) & 255;
-    if (SKIP_CODES.has(code)) return;
-    const name = TILE_LABELS[code];
-    if (!name) return;
-    const rec = getOverlay(canvas);
-    if (!rec) return;
-    const id = labelPositionId(rect);
-    rec.labels.set(id, {
-      key: k,
-      code,
-      name,
-      aka: AKA_CODES.has(code),
-      rect,
-      pendingSince: null,
-    });
-    rec.dirty = true;
-    tileOverlay.stats.labels++;
-    if (DEBUG && tileOverlay.stats.labels <= 8) {
-      W.console.log(
-        "[tenhou4-en] tile label",
-        name,
-        "code=" + code,
-        "@" + Math.round(rect.x) + "," + Math.round(rect.y)
-      );
-    }
-  }
-
-  function drawLabel(ctx, label) {
-    const r = label.rect;
-    ctx.save();
-    ctx.textBaseline = "top";
-    ctx.textAlign = "left";
-    let fontSize = Math.max(5, Math.min(r.w * 0.42, r.h * 0.34, 20));
-    const setFont = () => {
-      ctx.font = '700 ' + fontSize + 'px "Segoe UI", Arial, sans-serif';
-    };
-    const padX = () => Math.max(1, fontSize * 0.2);
-    const padY = () => Math.max(1, fontSize * 0.14);
-    setFont();
-    let textW = ctx.measureText(label.name).width;
-    const maxW = r.w - padX() * 2 - 1;
-    if (maxW > 0 && textW > maxW) {
-      fontSize = Math.max(4, Math.floor((fontSize * maxW) / textW));
-      setFont();
-      textW = ctx.measureText(label.name).width;
-    }
-    const boxW = textW + padX() * 2;
-    const boxH = fontSize + padY() * 2;
-    const x = r.x + Math.max(1, r.w * 0.04);
-    const y = r.y + Math.max(1, r.h * 0.04);
-    ctx.lineWidth = Math.max(0.5, fontSize * 0.06);
-    ctx.fillStyle = label.aka
-      ? "rgba(190,25,25,0.9)"
-      : "rgba(255,255,255,0.88)";
-    ctx.strokeStyle = "rgba(0,0,0,0.55)";
-    ctx.shadowColor = "rgba(0,0,0,0.3)";
-    ctx.shadowBlur = 2;
-    ctx.fillRect(x, y, boxW, boxH);
-    ctx.shadowBlur = 0;
-    ctx.strokeRect(x, y, boxW, boxH);
-    ctx.fillStyle = label.aka ? "#fff" : "#111";
-    ctx.fillText(label.name, x + padX(), y + padY());
-    ctx.restore();
-  }
-
-  function renderFrame() {
-    const now = nowMs();
-    for (const canvas of Array.from(trackedCanvases)) {
-      const rec = overlayRecords.get(canvas);
-      if (!rec) {
-        trackedCanvases.delete(canvas);
-        continue;
-      }
-
-      for (const [id, label] of rec.labels) {
-        if (label.pendingSince != null && now - label.pendingSince >= CLEAR_GRACE_MS) {
-          rec.labels.delete(id);
-          rec.dirty = true;
-        }
-      }
-
-      if (!canvas.isConnected || !canvas.parentNode || !isVisibleCanvas(canvas)) {
-        if (rec.overlay.style.visibility !== "hidden") {
-          rec.overlay.style.visibility = "hidden";
-        }
-        // Keep label records: hidden canvases are often shown again without a
-        // complete repaint, and destroying these records caused blank overlays.
-        continue;
-      }
-      if (rec.overlay.style.visibility === "hidden") {
-        rec.overlay.style.visibility = "visible";
-        rec.dirty = true;
-      }
-      if (!syncOverlay(canvas, rec)) continue;
-      if (!rec.dirty) continue;
-      const octx = rec.overlay.getContext("2d");
-      if (!octx) continue;
-      octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
-      for (const label of rec.labels.values()) drawLabel(octx, label);
-      rec.dirty = false;
-    }
-    raf(renderFrame);
-  }
-
-  function installCanvasHooks() {
-    W.__tenhou4enTileDraw = addTileLabel;
-    window.__tenhou4enTileDraw = addTileLabel;
-
-    const drawDesc = Object.getOwnPropertyDescriptor(CRC2D.prototype, "drawImage");
-    if (drawDesc && drawDesc.value && drawDesc.configurable) {
-      const nativeDrawImage = drawDesc.value;
-      Object.defineProperty(CRC2D.prototype, "drawImage", {
-        configurable: true,
-        enumerable: drawDesc.enumerable,
-        writable: true,
-        value: function (img) {
-          const res = nativeDrawImage.apply(this, arguments);
-          try {
-            if (!img || img.__tenhou4enTileKey == null) return res;
-            const canvas = this.canvas;
-            if (!canvas) return res;
-            const args = Array.prototype.slice.call(arguments, 1);
-            const rect = parseDrawArgs(img, args);
-            if (!rect) return res;
-            tileOverlay.stats.draws++;
-            addTileLabel(img.__tenhou4enTileKey, rect, canvas);
-          } catch (e) {
-            recordError(e);
-          }
-          return res;
-        },
-      });
-    } else {
-      pushClientError("drawImage descriptor unavailable");
-    }
-
-    const clearDesc = Object.getOwnPropertyDescriptor(CRC2D.prototype, "clearRect");
-    if (clearDesc && clearDesc.value && clearDesc.configurable) {
-      const nativeClearRect = clearDesc.value;
-      Object.defineProperty(CRC2D.prototype, "clearRect", {
-        configurable: true,
-        enumerable: clearDesc.enumerable,
-        writable: true,
-        value: function (x, y, w, h) {
-          const res = nativeClearRect.apply(this, arguments);
-          try {
-            const canvas = this.canvas;
-            if (!canvas || isOverlayCanvas(canvas)) return res;
-            const r = normalizeClearRect(x, y, w, h);
-            if (!r) return res;
-            tileOverlay.stats.clears++;
-            clearOverlayRect(canvas, r);
-          } catch (e) {
-            recordError(e);
-          }
-          return res;
-        },
-      });
-    } else {
-      pushClientError("clearRect descriptor unavailable");
-    }
-
-    for (const prop of ["width", "height"]) {
-      const desc = Object.getOwnPropertyDescriptor(HCE.prototype, prop);
-      if (!desc || !desc.set || !desc.configurable) {
-        pushClientError(prop + " descriptor unavailable");
-        continue;
-      }
-      Object.defineProperty(HCE.prototype, prop, {
-        configurable: true,
-        enumerable: desc.enumerable,
-        get() {
-          return desc.get.call(this);
-        },
-        set(v) {
-          const res = desc.set.call(this, v);
-          try {
-            if (!isOverlayCanvas(this)) resetCanvas(this);
-          } catch (e) {
-            recordError(e);
-          }
-          return res;
-        },
-      });
-    }
-  }
-
-  function installScriptHooks() {
-    const srcDesc = Object.getOwnPropertyDescriptor(HSE.prototype, "src");
-    if (srcDesc && srcDesc.set && srcDesc.configurable) {
-      Object.defineProperty(HSE.prototype, "src", {
-        configurable: true,
-        enumerable: srcDesc.enumerable,
-        get() {
-          return srcDesc.get.call(this);
-        },
-        set(value) {
-          return srcDesc.set.call(this, resolveClientUrl(value));
-        },
-      });
-    } else {
-      pushClientError("HTMLScriptElement.src descriptor unavailable");
-    }
-
-    const setAttrDesc = Object.getOwnPropertyDescriptor(ELEM.prototype, "setAttribute");
-    if (setAttrDesc && setAttrDesc.value && setAttrDesc.configurable) {
-      const nativeSetAttribute = setAttrDesc.value;
-      Object.defineProperty(ELEM.prototype, "setAttribute", {
-        configurable: true,
-        enumerable: setAttrDesc.enumerable,
-        writable: true,
-        value: function (name, value) {
-          const lname = String(name).toLowerCase();
-          const tag = this.tagName ? this.tagName.toUpperCase() : "";
-          if (tag === "SCRIPT" && lname === "src") {
-            return nativeSetAttribute.call(this, name, resolveClientUrl(value));
-          }
-          const result = nativeSetAttribute.call(this, name, value);
-          if (tag === "CANVAS" && (lname === "width" || lname === "height")) {
-            try {
-              if (!isOverlayCanvas(this)) resetCanvas(this);
-            } catch (e) {
-              recordError(e);
-            }
-          }
-          return result;
-        },
-      });
-    } else {
-      pushClientError("Element.setAttribute descriptor unavailable");
-    }
-  }
-
-  function installTileOverlay() {
-    if (!IS_DESKTOP4K) {
-      clientHook.disabledReason = "not a /4/ page";
-      return;
-    }
-    if (!CAN_HOOK) {
-      pushClientError("required DOM constructors missing; tile overlay disabled");
-      if (DEBUG) {
-        W.console.warn("[tenhou4-en] tile overlay: DOM constructors missing");
-      }
-      return;
-    }
-    installCanvasHooks();
-    installScriptHooks();
-    installInsertionHooks();
-    installClientObserver();
-    installStyleObserver();
-    scheduleScans();
-    raf(renderFrame);
-    if (DEBUG) {
-      W.console.log(
-        "%c[tenhou4-en] tile overlay installed (compact, always on)",
-        "color:#0a0;font-weight:bold"
-      );
-    }
-  }
-
-  installTileOverlay();
-
   // ---------------------------------------------------------------- language
+
+  // Must happen before latest.js reads it.  "en" and "EN" both resolve to en.
   try {
-    W.localStorage.setItem("lang", "en");
-  } catch (e) { }
+    localStorage.setItem("lang", "en");
+  } catch (e) {
+    /* private mode etc. */
+  }
 
   // ------------------------------------------------------- string table patch
 
   const LANG_URL_RE = /\/res\/lang\/string\d+_en\.json(?:[?#]|$)/;
 
+  // IDs the official EN table is missing (20, 214, 1029, 1103) or leaves in
+  // Japanese (223-226, 300, 301, 341).
   const TABLE_OVERRIDES = {
     20: ["Default", "2 TAPs", "3 TAPs"],
+
     214: [
-      "General", "Advanced", "Expert", "Phoenix",
-      "Wakaba", "Silver", "Amber", "Peacock",
+      "General",
+      "Advanced",
+      "Expert",
+      "Phoenix",
+      "Wakaba",
+      "Silver",
+      "Amber",
+      "Peacock",
     ],
+
     223:
       "You don't meet the requirements for <b>Advanced</b> tables " +
       "(1 Kyu or above, or 60+ days of Premium). " +
@@ -1076,14 +110,17 @@
     226:
       "You don't meet the requirements for <b>Jansou</b> tables " +
       "(Premium + 4 Dan / R1800 or above).",
+
     300: "Private Room",
     301: "Tournament",
     341: "<div class=desc>(Ranked / Jansou)</div>",
+
     1029:
       "ID or password is incorrect. You can reset your password on the " +
       "member page below.<br>" +
       "<a href='https://ron2.jp/3/member/' target=_blank>https://ron2.jp/3/member/</a><br>" +
       "Contact: support@ron2.jp",
+
     1103:
       "Special Promotion tables are open daily 21:00-25:00 (JST). " +
       "Entry requires 100 games played and R1800 or above.",
@@ -1098,6 +135,7 @@
     }
     if (!obj) return null;
 
+    // The server may send either {id: text} or [id, text, id, text, ...].
     if (Array.isArray(obj)) {
       const o = {};
       for (let i = 0; i + 1 < obj.length; i += 2) o[obj[i]] = obj[i + 1];
@@ -1109,13 +147,15 @@
     return obj;
   }
 
-  const XHR = W.XMLHttpRequest.prototype;
+  const XHR = XMLHttpRequest.prototype;
   const nativeOpen = XHR.open;
 
   XHR.open = function (method, url) {
     try {
       this.__tenhouUrl = String(url);
-    } catch (e) { }
+    } catch (e) {
+      /* ignore */
+    }
     return nativeOpen.apply(this, arguments);
   };
 
@@ -1131,6 +171,7 @@
         try {
           value = desc.get.call(this);
         } catch (e) {
+          // responseText throws when responseType is not "" / "text".
           return undefined;
         }
 
@@ -1155,6 +196,9 @@
   }
 
   // ------------------------------------------------------------- DOM strings
+
+  // Yaku ids are indices into the client's hard-coded Japanese array, and the
+  // result panel writes them straight into <div class="ym"> / <div class="yk">.
   const YAKU = {
     "門前清自摸和": "Menzen Tsumo",
     "立直": "Riichi",
@@ -1217,6 +261,8 @@
     "本場": "Honba",
     "明槓": "Open Kan",
     "暗槓": "Closed Kan",
+    // Non-standard labels at the end of the client's array.  Transliterated;
+    // verify against a real game if they ever show up.
     "五": "Five",
     "ガリ": "Gari",
     "セット": "Set",
@@ -1227,13 +273,26 @@
 
   const RANKS = {
     "新人": "Newcomer",
-    "１級": "1 Kyu", "２級": "2 Kyu", "３級": "3 Kyu",
-    "４級": "4 Kyu", "５級": "5 Kyu", "６級": "6 Kyu",
-    "７級": "7 Kyu", "８級": "8 Kyu", "９級": "9 Kyu",
-    "初段": "1 Dan", "二段": "2 Dan", "三段": "3 Dan",
-    "四段": "4 Dan", "五段": "5 Dan", "六段": "6 Dan",
-    "七段": "7 Dan", "八段": "8 Dan", "九段": "9 Dan",
-    "十段": "10 Dan", "天鳳": "Tenhou",
+    "１級": "1 Kyu",
+    "２級": "2 Kyu",
+    "３級": "3 Kyu",
+    "４級": "4 Kyu",
+    "５級": "5 Kyu",
+    "６級": "6 Kyu",
+    "７級": "7 Kyu",
+    "８級": "8 Kyu",
+    "９級": "9 Kyu",
+    "初段": "1 Dan",
+    "二段": "2 Dan",
+    "三段": "3 Dan",
+    "四段": "4 Dan",
+    "五段": "5 Dan",
+    "六段": "6 Dan",
+    "七段": "7 Dan",
+    "八段": "8 Dan",
+    "九段": "9 Dan",
+    "十段": "10 Dan",
+    "天鳳": "Tenhou",
   };
 
   const MISC = {
@@ -1265,6 +324,9 @@
     "以下": "or below",
     "点": "pts",
     "枚": "tiles",
+    // Limit hands and result-screen terms.  Tenhou uses the traditional
+    // forms (滿 / 數 / 役滿); the simplified forms are kept as a fallback.
+    "認定": "Certification",
     "滿貫": "Mangan",
     "跳滿": "Haneman",
     "倍滿": "Baiman",
@@ -1285,6 +347,7 @@
     "段位": "Dan Rank",
     "聴牌": "Tenpai",
     "不聴": "Noten",
+    // Lobby / room selection.
     "準備中": "Loading...",
     "四麻:": "4-player:",
     "三麻:": "3-player:",
@@ -1295,11 +358,15 @@
     "喰アリ赤光": "Kuitan Ari Red Flash",
     "三喰赤": "3P Kuitan Red",
     "三喰赤速": "3P Kuitan Red Fast",
+    // Lobby notice bar (outage announcement).
     "10/21,11/08に発生した障害の戦績修正を受け付けています":
       "Accepting results corrections for the 10/21 and 11/08 outages",
     "※喰断ナシON/OFF": "* Kuitan Nashi ON/OFF",
+    // Browser tab title.
     "天鳳 / Desktop4K版": "Tenhou / Desktop4K",
+    // In-game.
     "對局": "Game",
+    // /reg/ paid-membership page.
     "有料版有効期限の購入": "Purchase Paid Membership",
     "有料会員にのみ提供されているサービス(Windows版天鳳/鳳凰卓での対戦/有料の大会への参加/有料のトレーニングコンテンツ)を利用するには、 １つのプレーヤIDにつき「25日で550円」または「22日500円」の利用料金をお支払いいただく必要があります。 数か月分まとめてお支払いいただくこともできます。 お支払いには以下の決済サービスがご利用いただけます。":
       'To use services available only to paid members (Windows Tenhou / Phoenix table matches / paid tournament entry / paid training content), you must pay a usage fee of "550 yen for 25 days" or "500 yen for 22 days" per player ID. You can pay for several months at once. The following payment services are accepted.',
@@ -1325,16 +392,33 @@
   };
 
   const EXACT = Object.assign({}, MISC, RANKS, YAKU);
+
   const WIND = { 東: "East", 南: "South", 西: "West", 北: "North" };
 
+  // Lobby tabs are single characters inside div.tab3 label.btn[for].  They must
+  // not be translated anywhere else (a player name could be 東).
   const TAB_LABELS = {
-    四: "4P", 三: "3P", 東: "East", 南: "South",
-    鳳: "Phoenix", 特: "Expert", 雀: "Jansou",
+    四: "4P",
+    三: "3P",
+    東: "East",
+    南: "South",
+    鳳: "Phoenix",
+    特: "Expert",
+    雀: "Jansou",
   };
 
+  // The round indicator (東1局) is split into separate text nodes: 東 / 1 / 局.
+  // Match the parent's reconstructed text, never a lone wind character, and
+  // rewrite the child nodes in place so the client keeps its own elements.
   const ROUND_RE = /^([東南西北])(\d+)局$/;
+
+  // The in-game panel wraps the round and seat wind in nested spans inside
+  // div.nopp, e.g. <div class=nopp><span>東</span><span>1</span><span>局</span>.
   const NOPP_ROUND_RE = /^([東南西北])(\d+)局$/;
   const NOPP_SEAT_RE = /^([東南西北])\s+(.+)$/;
+
+  // Original value of every text node we have rewritten.  Lets us rebuild the
+  // parent string on later mutations (the digit changes, 東 and 局 do not).
   const ORIGINALS = new WeakMap();
 
   function originalValue(node) {
@@ -1350,6 +434,8 @@
     const doc = parent.ownerDocument;
     if (!doc) return [];
     const out = [];
+    // NodeFilter.SHOW_TEXT === 4; avoid the global, which can be gone after a
+    // window closes (jsdom) or during teardown.
     const w = doc.createTreeWalker(parent, 4, null);
     let n;
     while ((n = w.nextNode())) out.push(n);
@@ -1359,14 +445,19 @@
   function translateNoppContainer(node) {
     const start = node.parentElement;
     if (!start || !start.closest) return false;
+
     const container = start.closest("div.nopp");
     if (!container) return false;
 
     const nodes = childTextNodes(container);
     if (!nodes.length) return false;
 
-    const original = nodes.map(originalValue).join("").trim();
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .trim();
 
+    // Round: 東1局 -> East 1
     let m = NOPP_ROUND_RE.exec(original);
     if (m) {
       const wind = WIND[m[1]];
@@ -1378,6 +469,7 @@
       return true;
     }
 
+    // Seat wind + score or player name: 南 25000 / 北 COM / 南 vanicake
     m = NOPP_SEAT_RE.exec(original);
     if (m) {
       const wind = WIND[m[1]];
@@ -1391,6 +483,7 @@
       }
       return true;
     }
+
     return false;
   }
 
@@ -1402,6 +495,9 @@
     return RANK_WORDS;
   }
 
+  // Result dialog: the seat wind is a lone text node before the player name,
+  // e.g. [西][ COM][25000][-2600].  Translate it only when it is the first
+  // text of a box that also shows a score, so a bare 東 elsewhere is safe.
   function translateResultSeat(node) {
     const text = node.nodeValue.trim();
     if (!WIND[text]) return false;
@@ -1411,6 +507,8 @@
       const nodes = childTextNodes(box).filter((n) => originalValue(n).trim());
       if (!nodes.length || nodes[0] !== node) continue;
       const joined = nodes.map(originalValue).join(" ");
+      // Result dialog: a score follows.  Match-start dialog: a rank follows
+      // (東 / 新人 / COM).  Either way the wind is the first text of its box.
       const nextText = nodes[1] ? originalValue(nodes[1]).trim() : "";
       if (/\d{4,6}/.test(joined) || rankWords().has(nextText)) {
         setNodeValue(node, WIND[text] + " ");
@@ -1423,13 +521,17 @@
   function translateRoundParent(node) {
     const parent = node.parentNode;
     if (!parent || parent.nodeType !== 1) return false;
+
     const tag = parent.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
 
     const nodes = childTextNodes(parent);
     if (!nodes.length) return false;
 
-    const original = nodes.map(originalValue).join("").replace(/\s+/g, "");
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .replace(/\s+/g, "");
     const m = ROUND_RE.exec(original);
     if (!m) return false;
 
@@ -1439,13 +541,20 @@
     for (const n of nodes) {
       const value = originalValue(n);
       const text = value.trim();
-      if (text === whole) setNodeValue(n, `${wind} ${m[2]}`);
-      else if (text === m[1]) setNodeValue(n, `${wind} `);
-      else if (text === "局") setNodeValue(n, "");
+
+      if (text === whole) {
+        setNodeValue(n, `${wind} ${m[2]}`);
+      } else if (text === m[1]) {
+        setNodeValue(n, `${wind} `);
+      } else if (text === "局") {
+        setNodeValue(n, "");
+      }
     }
     return true;
   }
 
+  // Counters whose number and unit can be split into separate text nodes,
+  // e.g. 3 / 本場 or 12000 / 点.
   const SPLIT_COUNTER_RE = /^(\d+)(本場|枚|点|翻|飜|符|人|位|戦|日)$/;
 
   function ordinal(n) {
@@ -1457,16 +566,25 @@
 
   function counterSuffix(unit, n) {
     switch (unit) {
-      case "本場": return " Honba";
-      case "枚": return " tiles";
-      case "点": return " pts";
+      case "本場":
+        return " Honba";
+      case "枚":
+        return " tiles";
+      case "点":
+        return " pts";
       case "翻":
-      case "飜": return " han";
-      case "符": return " fu";
-      case "人": return n === "1" ? " player" : " players";
-      case "戦": return " games";
-      case "日": return " days";
-      case "位": return "";
+      case "飜":
+        return " han";
+      case "符":
+        return " fu";
+      case "人":
+        return n === "1" ? " player" : " players";
+      case "戦":
+        return " games";
+      case "日":
+        return " days";
+      case "位":
+        return ""; // the number node becomes 1st / 2nd / ...
     }
     return null;
   }
@@ -1474,13 +592,17 @@
   function translateSplitCounter(node) {
     const parent = node.parentNode;
     if (!parent || parent.nodeType !== 1) return false;
+
     const tag = parent.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return false;
 
     const nodes = childTextNodes(parent);
-    if (nodes.length < 2) return false;
+    if (nodes.length < 2) return false; // single node is handled by RULES
 
-    const original = nodes.map(originalValue).join("").replace(/\s+/g, "");
+    const original = nodes
+      .map(originalValue)
+      .join("")
+      .replace(/\s+/g, "");
     const m = SPLIT_COUNTER_RE.exec(original);
     if (!m) return false;
 
@@ -1489,19 +611,35 @@
 
     for (const n of nodes) {
       const text = originalValue(n).trim();
-      if (text === unit) setNodeValue(n, counterSuffix(unit, num));
-      else if (unit === "位" && text === num) setNodeValue(n, ordinal(num));
+      if (text === unit) {
+        setNodeValue(n, counterSuffix(unit, num));
+      } else if (unit === "位" && text === num) {
+        setNodeValue(n, ordinal(num));
+      }
     }
     return true;
   }
 
+  // Table names are generated by the client as:
+  //   [四三][tier][東南] + (喰|断)? + 赤? + (速|光)? + 祝N?
+  // e.g. 四鳳南喰赤 = 4P Phoenix South Open Red
+  //      四若東速祝５ = 4P Wakaba East Fast Anniv 5
   const TABLE_TIERS = {
-    般: "General", 上: "Advanced", 特: "Expert", 鳳: "Phoenix",
-    若: "Wakaba", 銀: "Silver", 琥: "Amber", 孔: "Peacock", 雀: "Jansou",
+    般: "General",
+    上: "Advanced",
+    特: "Expert",
+    鳳: "Phoenix",
+    若: "Wakaba",
+    銀: "Silver",
+    琥: "Amber",
+    孔: "Peacock",
+    雀: "Jansou",
   };
 
   function translateTableName(text) {
-    const m = /^([四三])([般上特鳳若銀琥孔雀])([東南])(喰|断)?(赤)?(速|光)?(祝[０-９0-9]?)?$/.exec(text);
+    const m = /^([四三])([般上特鳳若銀琥孔雀])([東南])(喰|断)?(赤)?(速|光)?(祝[０-９0-9]?)?$/.exec(
+      text
+    );
     if (!m) return null;
     const parts = [
       m[1] === "四" ? "4P" : "3P",
@@ -1514,53 +652,90 @@
     if (m[6] === "速") parts.push("Fast");
     else if (m[6] === "光") parts.push("Flash");
     if (m[7]) {
-      const n = m[7].slice(1).replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
+      const n = m[7]
+        .slice(1)
+        .replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
       parts.push(n ? `Anniv ${n}` : "Anniv");
     }
     return parts.join(" ");
   }
 
   const RULES = [
+    // 東1局 / 南3局
     [/^([東南西北])(\d+)局$/, (m) => `${WIND[m[1]]} ${m[2]}`],
+    // 東場
     [/^([東南西北])場$/, (m) => `${WIND[m[1]]} Round`],
+    // 3本場
     [/^(\d+)本場$/, (m) => `${m[1]} Honba`],
+    // 25枚
     [/^(\d+)枚$/, (m) => `${m[1]} tiles`],
+    // 12000点
     [/^(\d+)点$/, (m) => `${m[1]} pts`],
+    // 3翻
     [/^(\d+)[翻飜]$/, (m) => `${m[1]} han`],
+    // 40符
     [/^(\d+)符$/, (m) => `${m[1]} fu`],
+    // 4人 / 1人
     [/^(\d+)人$/, (m) => `${m[1]} ${m[1] === "1" ? "player" : "players"}`],
+    // 1位 / 2位
     [/^(\d+)位$/, (m) => ordinal(m[1])],
+    // 100戦
     [/^(\d+)戦$/, (m) => `${m[1]} games`],
+    // 30日
     [/^(\d+)日$/, (m) => `${m[1]} days`],
+    // R1800 stays as-is; kept explicit so the rule set is complete.
     [/^R(\d+)$/, (m) => `R${m[1]}`],
+    // Table name, generated by the client as:
+    //   [四三][tier][東南] + (喰|断)? + 赤? + (速|光)? + 祝N?
     [/^([四三][般上特鳳若銀琥孔雀][東南][^\s　]*)$/, (m) => translateTableName(m[1])],
+    // Game-select list: table name followed by the player count, e.g.
+    //   四般東喰赤　  2:
     [
       /^([四三][般上特鳳若銀琥孔雀][東南][^\s　]*)[\s　]+(\d+):$/,
       (m) => `${translateTableName(m[1])}  ${m[2]}:`,
     ],
+    // Room notes in the game-select list: ※四麻上級卓 etc.
     [
       /^※([四三])麻(一般卓|上級卓|特上卓|鳳凰卓|若葉卓|雀荘戦)$/,
       (m) => {
-        const table = {
-          一般卓: "General table",
-          上級卓: "Advanced table",
-          特上卓: "Expert table",
-          鳳凰卓: "Phoenix table",
-          若葉卓: "Wakaba table",
-          雀荘戦: "Jansou match",
-        }[m[2]];
+        const table =
+          {
+            一般卓: "General table",
+            上級卓: "Advanced table",
+            特上卓: "Expert table",
+            鳳凰卓: "Phoenix table",
+            若葉卓: "Wakaba table",
+            雀荘戦: "Jansou match",
+          }[m[2]];
         return `* ${m[1] === "四" ? "4P" : "3P"} ${table}`;
       },
     ],
+    // 供託 / ドラ etc. handled by EXACT.
   ];
+
+  // A rank embedded in a sentence ("promoted to: ９級 ...").  Only matches when
+  // the rank stands alone as a word, so names that merely contain one are safe.
+  const INLINE_RANK_RE = new RegExp(
+    "(^|[\\s:：(（])(" +
+    Object.keys(RANKS)
+      .sort((a, b) => b.length - a.length)
+      .join("|") +
+    ")(?=$|[\\s.,!?)）。、])",
+    "g"
+  );
 
   function translateString(text) {
     const direct = EXACT[text];
     if (direct != null) return direct;
+
     for (const [re, fn] of RULES) {
       const m = re.exec(text);
       if (m) return fn(m);
     }
+
+    INLINE_RANK_RE.lastIndex = 0;
+    const inline = text.replace(INLINE_RANK_RE, (m, pre, rank) => pre + RANKS[rank]);
+    if (inline !== text) return inline;
     return null;
   }
 
@@ -1569,6 +744,8 @@
   function translateContext(node) {
     const el = node.parentElement;
     if (!el || !el.matches) return false;
+
+    // <div class="tab3"><label class="btn" for="wg02">四</label></div>
     if (el.matches("div.tab3 label.btn[for]")) {
       const raw = node.nodeValue;
       const text = raw.trim();
@@ -1585,24 +762,44 @@
     const raw = node.nodeValue;
     if (!raw) return;
 
+    // Never touch executable or style content.  walk() prunes these subtrees,
+    // but characterData callbacks can still land on them.
     const parent = node.parentNode;
     if (parent && parent.nodeType === 1) {
       const ptag = parent.tagName;
       if (ptag === "SCRIPT" || ptag === "STYLE" || ptag === "TEXTAREA") return;
     }
 
+    // Player names are user content, never UI strings.
     const pel = node.parentElement;
-    if (pel && pel.closest && pel.closest('a[href*="tenhou.net/0/?wg="]')) return;
+    if (
+      pel &&
+      pel.closest &&
+      pel.closest('a[href*="tenhou.net/0/?wg="]')
+    ) {
+      return;
+    }
 
+    // Context-only labels (single-character lobby tabs).
     if (translateContext(node)) return;
+
+    // In-game round / seat panel (nested spans inside div.nopp).
     if (translateNoppContainer(node)) return;
+
+    // Result dialog seat winds (西 COM 25000 -2600).
     if (translateResultSeat(node)) return;
+
+    // Round text is split across sibling nodes; handle it at the parent level.
     if (translateRoundParent(node)) return;
+
+    // Numbers and their unit may also be separate nodes (3 / 本場).
     if (translateSplitCounter(node)) return;
 
     const text = raw.trim();
     if (!text) return;
 
+    // Static-page paragraphs can contain newlines/tabs; match them normalized
+    // and replace the whole node.
     const normalized = text.replace(/\s+/g, " ");
     const normalizedHit = EXACT[normalized];
     if (normalizedHit != null && normalizedHit !== normalized) {
@@ -1667,10 +864,352 @@
   if (document.documentElement) start();
   else document.addEventListener("DOMContentLoaded", start, { once: true });
 
-  // Tile overlay hooks are installed above, before /4/latest.js loads.
+  // ------------------------------------------------------------- tile labels
+  //
+  // How it works (derived from latest.js):
+  //   * Every tile sprite is a record in an "obj0".."obj3" .dat file, keyed by
+  //       key = sheet | slot<<8 | face<<16 | seat<<24
+  //     sheet: 116 hand, 121 wall, 107 discards, 110 melds/dora/etc.
+  //     face : 0 red 5m, 1-9 man, 10 red 5p, 11-19 pin, 20 red 5s, 21-29 sou,
+  //            30-33 E S W N, 34 white, 35 green, 36 red dragon, 37 back.
+  //   * Ac.zb() builds the pixels for one sprite: it inflates the blank base
+  //     tile (face 34), inflates the face record (the artwork delta), then
+  //     inflates the shadow record (face 38/39), and the caller immediately
+  //     writes the ImageData to a per-slot canvas with putImageData().
+  //     The canvas is re-decoded whenever its face changes, so painting on it
+  //     once would be wiped.  Instead we watch the three inflates, remember
+  //     which face was just decoded, and draw the label right after the
+  //     matching putImageData().
+  //   * The artwork rect inside the sprite is face.xy - base.xy, size face.wh.
+  //
+  // <tiles>
+  const TILES_ENABLED = (() => {
+    try {
+      return localStorage.getItem("tenhou4enTiles") !== "0";
+    } catch (e) {
+      return true;
+    }
+  })();
+  // "tl" = top-left corner of the tile face (default), "c" = centred.
+  const TILE_POS = (() => {
+    try {
+      return localStorage.getItem("tenhou4enTilePos") === "c" ? "c" : "tl";
+    } catch (e) {
+      return "tl";
+    }
+  })();
+  const TILE_SCALE = 0.42; // font size relative to the smaller side of the face
+  // Nudge as fractions of the face rect, e.g. "0.05,0" moves 5% right.
+  const TILE_OFF = (() => {
+    try {
+      const v = (localStorage.getItem("tenhou4enTileOff") || "0,0").split(",").map(Number);
+      return [v[0] || 0, v[1] || 0];
+    } catch (e) {
+      return [0, 0];
+    }
+  })();
 
-  // Debug helper
-  const debugApi = {
+  const OBJ_STRUCT = {
+    812278383: 103780, // obj0
+    829055599: 3856, // obj1
+    845832815: 103780, // obj2
+    862610031: 3856, // obj3
+  };
+  const TILE_SHEETS = { 107: 1, 110: 1, 116: 1, 121: 1 };
+
+  const tileStats = {
+    zlibWrapped: false,
+    putWrapped: false,
+    buffers: 0,
+    records: 0,
+    inflates: 0,
+    jobs: 0,
+    labeled: 0,
+    sizeMismatch: 0,
+    errors: 0,
+  };
+
+  // Per (sheet, slot, seat): the union of the artwork rects of all faces, so
+  // every tile in a slot gets its label at the same spot.
+  const GROUPS = new Map();
+  function noteGroup(rec) {
+    const face = (rec.key >>> 16) & 255;
+    if (face === 34 || face > 36 || rec.w <= 0 || rec.i <= 0) return;
+    const gk = (rec.key & 0xff00ffff) >>> 0;
+    let g = GROUPS.get(gk);
+    if (!g) {
+      g = { u: { x0: rec.x, y0: rec.y, x1: rec.x + rec.w, y1: rec.y + rec.i } };
+      GROUPS.set(gk, g);
+      return;
+    }
+    g.u.x0 = Math.min(g.u.x0, rec.x);
+    g.u.y0 = Math.min(g.u.y0, rec.y);
+    g.u.x1 = Math.max(g.u.x1, rec.x + rec.w);
+    g.u.y1 = Math.max(g.u.y1, rec.y + rec.i);
+  }
+
+  // Same key normalisation as sc.kc(): sheet 110 slots are remapped.
+  function normalizeKey(x) {
+    const sheet = x & 255;
+    let slot = (x >>> 8) & 255;
+    if (sheet === 110) {
+      if (slot >= 20 && slot < 38) slot = 40 + (slot % 20);
+      else if (slot >= 40 && slot < 58) slot = 98 + (slot % 20);
+      else if (slot >= 60 && slot < 78) slot = 120 + (slot % 20);
+    }
+    return (
+      (sheet | (slot << 8) | (((x >>> 16) & 255) << 16) | (((x >>> 24) & 255) << 24)) >>> 0
+    );
+  }
+
+  // Replica of the obj* branch of sc.kc().  Returns Map(dataOffset -> record)
+  // for tile sheets, or null when the buffer is not an obj file.
+  function parseObjBuffer(buf) {
+    if (!buf || typeof buf.byteLength !== "number" || buf.byteLength < 28) return null;
+    const dv = new DataView(buf);
+    const magic = dv.getUint32(0, true);
+    const structSize = OBJ_STRUCT[magic];
+    if (!structSize || dv.getUint32(4, true) !== structSize) return null;
+
+    let p = 12;
+    if (magic === 829055599 || magic === 862610031) p += 12; // 3 floats
+    const byOffset = new Map();
+    const end = Math.min(structSize, buf.byteLength);
+    for (let a = p; a + 4 <= end; a += 4) {
+      const m = dv.getUint32(a, true);
+      if (!m || m + 20 > buf.byteLength) continue;
+      const key = normalizeKey(dv.getUint32(m + 8, true));
+      if (!TILE_SHEETS[key & 255]) continue;
+      const rec = {
+        x: dv.getInt16(m, true),
+        y: dv.getInt16(m + 2, true),
+        w: dv.getInt16(m + 4, true),
+        i: dv.getInt16(m + 6, true),
+        key,
+        dc: dv.getUint32(m + 16, true),
+      };
+      noteGroup(rec);
+      byOffset.set(m + 20, rec);
+    }
+    tileStats.buffers++;
+    tileStats.records += byOffset.size;
+    return byOffset;
+  }
+
+  const BUF_TABLES = new WeakMap();
+  let curSprite = null; // { base, face } for the sprite being decoded
+  let pendingJob = null; // label waiting for the next putImageData()
+
+  function makeJob(base, face) {
+    const faceId = (face.key >>> 16) & 255;
+    if (faceId > 36) return null; // back / shadow variants get no label
+    let rect = null;
+    const grp = GROUPS.get((face.key & 0xff00ffff) >>> 0);
+    if (grp) {
+      const u = grp.u;
+      const r = { x: u.x0 - base.x, y: u.y0 - base.y, w: u.x1 - u.x0, h: u.y1 - u.y0 };
+      if (r.w > 0 && r.h > 0 && r.x >= -1 && r.y >= -1 && r.x + r.w <= base.w + 1 && r.y + r.h <= base.i + 1) {
+        rect = r;
+      }
+    }
+    if (!rect && face !== base) {
+      rect = { x: face.x - base.x, y: face.y - base.y, w: face.w, h: face.i };
+      if (rect.w <= 0 || rect.h <= 0 || rect.x < 0 || rect.y < 0) rect = null;
+    }
+    if (!rect) {
+      // The white dragon has no artwork record: use the inner tile area.
+      rect = { x: base.w * 0.14, y: base.i * 0.1, w: base.w * 0.72, h: base.i * 0.8 };
+    }
+    return {
+      face: faceId,
+      w: base.w,
+      h: base.i,
+      rect,
+      sheet: face.key & 255,
+      slot: (face.key >>> 8) & 255,
+      seat: face.key >>> 24,
+    };
+  }
+
+  function onInflate(u8) {
+    if (!u8 || !u8.buffer) return;
+    let tab = BUF_TABLES.get(u8.buffer);
+    if (tab === undefined) {
+      tab = parseObjBuffer(u8.buffer);
+      BUF_TABLES.set(u8.buffer, tab);
+    }
+    if (!tab) return;
+    const rec = tab.get(u8.byteOffset);
+    if (!rec) return;
+    tileStats.inflates++;
+
+    const face = (rec.key >>> 16) & 255;
+    if (face === 38 || face === 39) {
+      // Shadow record: always the last inflate of one sprite decode.
+      pendingJob = curSprite ? makeJob(curSprite.base, curSprite.face) : null;
+      if (pendingJob) tileStats.jobs++;
+      curSprite = null;
+    } else if (face === 34 || face === 37) {
+      curSprite = { base: rec, face: rec }; // a new decode starts at its base
+    } else if (curSprite) {
+      curSprite.face = rec;
+    }
+  }
+
+  function tileText(face) {
+    if (face >= 30 && face <= 36) {
+      return {
+        text: ["E", "S", "W", "N", "Wh", "Gr", "Rd"][face - 30],
+        bg: "#6c3483",
+        fg: "#fff",
+      };
+    }
+    const suit = face < 10 ? "m" : face < 20 ? "p" : "s";
+    const n = face % 10;
+    const bg = { m: "#b03a2e", p: "#1f618d", s: "#1e8449" }[suit];
+    if (n === 0) return { text: "5" + suit, bg: "#c9a000", fg: "#000" }; // red five
+    return { text: n + suit, bg, fg: "#fff" };
+  }
+
+  function drawTileLabel(ctx, job) {
+    const info = tileText(job.face);
+    const r = job.rect;
+    const fs = Math.max(8, Math.round(Math.min(r.w, r.h) * TILE_SCALE));
+    ctx.save();
+    ctx.font = "bold " + fs + "px sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    const padX = Math.round(fs * 0.22);
+    const padY = Math.round(fs * 0.12);
+    const w = Math.ceil(ctx.measureText(info.text).width + padX * 2);
+    const h = Math.ceil(fs + padY * 2);
+    let x = (TILE_POS === "c" ? r.x + (r.w - w) / 2 : r.x) + TILE_OFF[0] * r.w;
+    let y = (TILE_POS === "c" ? r.y + (r.h - h) / 2 : r.y) + TILE_OFF[1] * r.h;
+    x = Math.max(0, Math.min(job.w - w, x));
+    y = Math.max(0, Math.min(job.h - h, y));
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = info.bg;
+    ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = info.fg;
+    ctx.fillText(info.text, x + padX, y + h / 2 + 0.5);
+    ctx.restore();
+  }
+
+  function wrapZlib(Z) {
+    if (!Z || typeof Z.Inflate !== "function" || Z.Inflate.__t4en) return Z;
+    const Orig = Z.Inflate;
+    const Wrapped = function (input, opts) {
+      try {
+        onInflate(input);
+      } catch (e) {
+        tileStats.errors++;
+      }
+      return new Orig(input, opts);
+    };
+    Wrapped.prototype = Orig.prototype;
+    for (const k of Object.keys(Orig)) Wrapped[k] = Orig[k];
+    Wrapped.__t4en = true;
+    Z.Inflate = Wrapped;
+    tileStats.zlibWrapped = true;
+    return Z;
+  }
+
+  function installTileHooks() {
+    if (!TILES_ENABLED) return;
+    if (String(location.pathname).indexOf("/4/") !== 0) return;
+
+    const proto = window.CanvasRenderingContext2D && window.CanvasRenderingContext2D.prototype;
+    if (proto && typeof proto.putImageData === "function" && !proto.putImageData.__t4en) {
+      const nativePut = proto.putImageData;
+      const put = function (img) {
+        const r = nativePut.apply(this, arguments);
+        const job = pendingJob;
+        if (job) {
+          pendingJob = null;
+          try {
+            if (img && img.width === job.w && img.height === job.h) {
+              drawTileLabel(this, job);
+              tileStats.labeled++;
+            } else {
+              tileStats.sizeMismatch++;
+            }
+          } catch (e) {
+            tileStats.errors++;
+          }
+        }
+        return r;
+      };
+      put.__t4en = true;
+      proto.putImageData = put;
+      tileStats.putWrapped = true;
+    }
+
+    // Wrap Zlib.Inflate as soon as the page defines Zlib.
+    let zlib = window.Zlib;
+    try {
+      Object.defineProperty(window, "Zlib", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return zlib;
+        },
+        set(v) {
+          zlib = wrapZlib(v);
+        },
+      });
+    } catch (e) {
+      /* fall back to polling below */
+    }
+    if (zlib) zlib = wrapZlib(zlib);
+
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (window.Zlib && window.Zlib.Inflate && !window.Zlib.Inflate.__t4en) wrapZlib(window.Zlib);
+      if (tileStats.zlibWrapped || ++tries > 600) clearInterval(timer);
+    }, 100);
+  }
+
+  const tilesApi = {
+    install: installTileHooks,
+    stats() {
+      return Object.assign({ enabled: TILES_ENABLED, pos: TILE_POS }, tileStats);
+    },
+    setEnabled(on) {
+      try {
+        localStorage.setItem("tenhou4enTiles", on ? "1" : "0");
+      } catch (e) {
+        /* ignore */
+      }
+      console.log("[tenhou4-en] tile labels " + (on ? "on" : "off") + " - reload the page");
+    },
+    setPosition(pos) {
+      try {
+        localStorage.setItem("tenhou4enTilePos", pos === "c" ? "c" : "tl");
+      } catch (e) {
+        /* ignore */
+      }
+      console.log("[tenhou4-en] tile label position set - reload the page");
+    },
+    setOffset(dx, dy) {
+      try {
+        localStorage.setItem("tenhou4enTileOff", (Number(dx) || 0) + "," + (Number(dy) || 0));
+      } catch (e) {
+        /* ignore */
+      }
+      console.log("[tenhou4-en] tile label offset set - reload the page");
+    },
+    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText },
+  };
+  // </tiles>
+
+  tilesApi.install();
+
+  // --------------------------------------------------------------- debugging
+
+  window.__tenhou4en = {
+    version: VERSION,
+    tiles: tilesApi,
     yaku: YAKU,
     ranks: RANKS,
     misc: MISC,
@@ -1678,8 +1217,13 @@
     patchTable,
     translateString,
     translateTextNode,
+    translateContext,
+    translateNoppContainer,
+    translateResultSeat,
+    rankWords,
+    translateRoundParent,
+    translateSplitCounter,
     walk,
-    tileOverlay,
     add(ja, en) {
       EXACT[ja] = en;
       walk(document.body);
@@ -1695,17 +1239,9 @@
       return [...found];
     },
   };
-  W.__tenhou4en = debugApi;
-  window.__tenhou4en = debugApi;
 
   console.log(
-    "%c[tenhou4-en] v0.4.1 loaded - compact English tile names are always on" +
-    (IS_DESKTOP4K ? "" : " (tile overlay: /4 only)"),
+    "%c[tenhou4-en] v" + VERSION + " loaded - English UI + tile labels",
     "color:#0a0;font-weight:bold"
   );
-  if (DEBUG && IS_DESKTOP4K) {
-    console.log(
-      "[tenhou4-en] verify tile hooks with: __tenhou4en.tileOverlay.report()"
-    );
-  }
 })();
