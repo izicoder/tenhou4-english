@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Tenhou /4 English + Tile Overlay
-// @name:ja      天鳳 /4 英語化 + 牌ラベル
+// @name         Tenhou /4 English + Compact Tile Names
+// @name:ja      天鳳 /4 英語化 + 英語牌名
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.2.0
-// @description  Completes the English UI on tenhou.net/4 (Desktop4K) and adds Majsoul-style tile number/letter overlays.
+// @version      0.3.0
+// @description  Completes the English UI on tenhou.net/4 (Desktop4K) and draws always-on compact English tile names over every face-up tile.
 // @author       you
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
@@ -13,6 +13,7 @@
 // @match        https://tenhou.net/reg/
 // @run-at       document-start
 // @grant        none
+// @noframes
 // @license      MIT
 // ==/UserScript==
 
@@ -21,36 +22,748 @@
  * --------------
  * 1. String-table patch (official EN JSON)
  * 2. MutationObserver for hard-coded Japanese strings
- * 3. Tile Overlay (Majsoul-style indices)
+ * 3. Compact English tile-name overlay (always on)
  *
- * Toggle the overlay anytime with:
- *   localStorage.setItem("tenhou4enTiles", "1")   // on
- *   localStorage.setItem("tenhou4enTiles", "0")   // off
- * or press  Ctrl+Shift+T
+ * Tenhou /4 draws tiles on canvases, not DOM tiles. At document-start this
+ * script fetches /4/latest.js, injects two tiny hooks into its minified
+ * tile-canvas factories, and loads the patched client from a Blob URL. It then
+ * wraps CanvasRenderingContext2D.drawImage / clearRect and the canvas width /
+ * height setters so transparent overlay canvases stay in sync with every
+ * visible game canvas.
+ *
+ * Labels are permanent: no hotkey, no localStorage on/off switch. Face-down
+ * tile backs are skipped. Red fives get a red badge.
+ *
+ * Debug / verification:
+ *   add ?tenhou_en_debug=1 to the URL (or localStorage.tenhou4enDebug = "1")
+ *   then run:  __tenhou4en.tileOverlay.dump()
+ * If Tenhou ships a new minified client and a patch point moves, the dump
+ * includes the exact snippets needed to update the replacements below.
  */
 
 (function () {
   "use strict";
 
-  if (window.__tenhou4enInstalled) return;
+  const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  if (W.__tenhou4enInstalled) return;
+  W.__tenhou4enInstalled = true;
   window.__tenhou4enInstalled = true;
 
+  const D = W.document;
+
   const DEBUG =
-    /[?&]tenhou_en_debug=1\b/.test(location.search) ||
+    /[?&]tenhou_en_debug=1\b/.test(W.location.search) ||
     (() => {
       try {
-        return localStorage.getItem("tenhou4enDebug") === "1";
+        return W.localStorage.getItem("tenhou4enDebug") === "1";
       } catch (e) {
         return false;
       }
     })();
 
+  const IS_DESKTOP4K = /^\/4\//.test(W.location.pathname);
+
+  // ===================================================================
+  // COMPACT ENGLISH TILE NAMES  (always on)
+  // ===================================================================
+
+  const TILE_LABELS = {
+    0: "5m", 10: "5p", 20: "5s",       // red fives (aka)
+    1: "1m", 2: "2m", 3: "3m", 4: "4m", 5: "5m", 6: "6m", 7: "7m", 8: "8m", 9: "9m",
+    11: "1p", 12: "2p", 13: "3p", 14: "4p", 15: "5p", 16: "6p", 17: "7p", 18: "8p", 19: "9p",
+    21: "1s", 22: "2s", 23: "3s", 24: "4s", 25: "5s", 26: "6s", 27: "7s", 28: "8s", 29: "9s",
+    30: "E", 31: "S", 32: "W", 33: "N",
+    34: "Haku", 35: "Hatsu", 36: "Chun",
+  };
+  const AKA_CODES = new Set([0, 10, 20]);
+  const SKIP_CODES = new Set([37, 255]); // tile back / unknown
+
+  const CRC2D = W.CanvasRenderingContext2D;
+  const HCE = W.HTMLCanvasElement;
+  const HSE = W.HTMLScriptElement;
+  const ELEM = W.Element;
+  const CAN_HOOK = !!(CRC2D && HCE && HSE && ELEM);
+
+  const trackedCanvases = new Set();
+  const visibilityCache = new WeakMap();
+  const overlayRecords = new WeakMap();
+  const raf = W.requestAnimationFrame
+    ? W.requestAnimationFrame.bind(W)
+    : (cb) => W.setTimeout(cb, 16);
+
+  const clientHook = {
+    attempted: false,
+    patched: false,
+    requestUrl: "",
+    finalUrl: "",
+    codeLength: 0,
+    patchedLength: 0,
+    applied: [],
+    errors: [],
+    snippets: {},
+    blobUrl: "",
+    disabledReason: IS_DESKTOP4K ? "" : "not a /4/ page",
+  };
+
+  const tileOverlay = {
+    version: "0.3.0",
+    mode: "compact",
+    scope: "all face-up tiles",
+    enabled: true,
+    toggle: false,
+    hotkey: null,
+    labels: TILE_LABELS,
+    aka: Array.from(AKA_CODES),
+    stats: { draws: 0, labels: 0, clears: 0, overlays: 0, errors: [] },
+    dump() {
+      const overlays = [];
+      for (const c of Array.from(trackedCanvases)) {
+        const rec = overlayRecords.get(c);
+        if (!rec) continue;
+        overlays.push({
+          canvas: {
+            tagName: c.tagName,
+            className: c.className || "",
+            width: c.width,
+            height: c.height,
+            connected: !!c.isConnected,
+          },
+          labelCount: rec.labels.size,
+          sample: Array.from(rec.labels.values()).slice(0, 8).map((l) => ({
+            code: l.code,
+            name: l.name,
+            aka: l.aka,
+            x: Math.round(l.rect.x),
+            y: Math.round(l.rect.y),
+            w: Math.round(l.rect.w),
+            h: Math.round(l.rect.h),
+          })),
+        });
+      }
+      return {
+        version: this.version,
+        mode: this.mode,
+        scope: this.scope,
+        enabled: this.enabled,
+        desktop4k: IS_DESKTOP4K,
+        canHook: CAN_HOOK,
+        debug: DEBUG,
+        client: JSON.parse(JSON.stringify(clientHook)),
+        stats: Object.assign({}, this.stats, { errors: this.stats.errors.slice() }),
+        overlays,
+      };
+    },
+    report() {
+      return JSON.stringify(this.dump(), null, 2);
+    },
+    forceRedraw() {
+      for (const c of Array.from(trackedCanvases)) {
+        const rec = overlayRecords.get(c);
+        if (rec) rec.dirty = true;
+      }
+      return true;
+    },
+  };
+
+  function pushClientError(msg) {
+    if (clientHook.errors.length < 20) clientHook.errors.push(String(msg));
+  }
+
+  function recordError(e) {
+    const msg = (e && (e.stack || e.message)) || String(e);
+    if (tileOverlay.stats.errors.length < 20) tileOverlay.stats.errors.push(msg);
+    if (DEBUG) W.console.warn("[tenhou4-en] tile overlay error:", e);
+  }
+
+  function isOverlayCanvas(canvas) {
+    return !!(
+      canvas &&
+      canvas.classList &&
+      canvas.classList.contains("tenhou4en-tile-overlay")
+    );
+  }
+
+  function isClientScriptUrl(value) {
+    try {
+      return new W.URL(String(value), W.location.href).pathname === "/4/latest.js";
+    } catch (e) {
+      return /\/4\/latest\.js(?:\?|$)/.test(String(value));
+    }
+  }
+
+  function snippet(code, needle) {
+    const i = code.indexOf(needle);
+    if (i < 0) return null;
+    return code.slice(
+      Math.max(0, i - 140),
+      Math.min(code.length, i + needle.length + 180)
+    );
+  }
+
+  function patchClientScript(code) {
+    const applied = [];
+    const errors = [];
+    const snippets = {};
+
+    function exact(from, to, label) {
+      const i = code.indexOf(from);
+      if (i < 0) {
+        errors.push("missing " + label);
+        snippets[label] = snippet(code, from);
+        return false;
+      }
+      code = code.replace(from, to);
+      applied.push(label);
+      return true;
+    }
+
+    const gFrom = ";return p}function e(h,a,n,p,q){";
+    const gTo =
+      ";p.ea.canvas.__tenhou4enTileKey=h;return p}function e(h,a,n,p,q){";
+    if (!exact(gFrom, gTo, "g-canvas")) {
+      const re =
+        /function\s+g\(h,a\)\{[\s\S]*?return p\}\s*function\s+e\(h,a,n,p,q\)\{/;
+      const m = re.exec(code);
+      if (m) {
+        const injected = m[0].replace(
+          "return p}",
+          "p.ea.canvas.__tenhou4enTileKey=h;return p}"
+        );
+        code =
+          code.slice(0, m.index) +
+          injected +
+          code.slice(m.index + m[0].length);
+        applied.push("g-canvas-regex");
+      } else {
+        errors.push("g-canvas regex did not match");
+        snippets["g-function"] = snippet(code, "function g(h,a){");
+      }
+    }
+
+    const eFrom = "f(r,Ac.zb(a,0));return{ea:r,s:a.s,da:q}";
+    const eTo =
+      "f(r,Ac.zb(a,0));r.canvas.__tenhou4enTileKey=a.oa;return{ea:r,s:a.s,da:q}";
+    if (!exact(eFrom, eTo, "e-canvas")) {
+      const re =
+        /function\s+e\(h,a,n,p,q\)\{[\s\S]*?return\{ea:r,s:a\.s,da:q\}\}/;
+      const m = re.exec(code);
+      if (m) {
+        const injected = m[0].replace(
+          "return{ea:r,s:a.s,da:q}",
+          "r.canvas.__tenhou4enTileKey=a.oa;return{ea:r,s:a.s,da:q}"
+        );
+        code =
+          code.slice(0, m.index) +
+          injected +
+          code.slice(m.index + m[0].length);
+        applied.push("e-canvas-regex");
+      } else {
+        errors.push("e-canvas regex did not match");
+        snippets["e-function"] = snippet(code, "function e(h,a,n,p,q){");
+      }
+    }
+
+    // Fallback for the main board when the g() cache hook could not be applied.
+    if (!applied.some((a) => a.indexOf("g-canvas") === 0)) {
+      const aaFrom =
+        "a.drawImage(m[n].ea.canvas,x.x-u,x.y-v,x.w,x.i,x.x,x.y,x.w,x.i),++wc.gg";
+      const aaTo =
+        "window.__tenhou4enTileDraw&&window.__tenhou4enTileDraw(p.c.oa,{x:x.x,y:x.y,w:x.w,i:x.i},a.canvas)," +
+        aaFrom;
+      exact(aaFrom, aaTo, "aa-draw");
+    }
+
+    if (applied.length) {
+      code += "\n/* tenhou4-en tile hooks: " + applied.join(", ") + " */\n";
+    }
+    return { ok: applied.length > 0, code, applied, errors, snippets };
+  }
+
+  function fetchAndPatch(rawUrl) {
+    const url = new W.URL(String(rawUrl), W.location.href).href;
+    clientHook.requestUrl = url;
+    clientHook.attempted = true;
+    let code;
+    try {
+      const xhr = new W.XMLHttpRequest();
+      xhr.open("GET", url, false);
+      if (xhr.overrideMimeType) xhr.overrideMimeType("text/plain; charset=utf-8");
+      xhr.send(null);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        throw new Error("HTTP " + xhr.status);
+      }
+      code = xhr.responseText;
+      clientHook.finalUrl = xhr.responseURL || url;
+      clientHook.codeLength = code.length;
+    } catch (e) {
+      pushClientError("fetch failed: " + ((e && e.message) || e));
+      recordError(e);
+      return false;
+    }
+
+    const result = patchClientScript(code);
+    clientHook.applied = result.applied.slice();
+    for (const msg of result.errors) pushClientError(msg);
+    clientHook.snippets = result.snippets;
+    clientHook.patchedLength = result.code.length;
+
+    if (!result.ok) {
+      pushClientError("no tile patch points matched; client script left unpatched");
+      if (DEBUG) W.console.warn("[tenhou4-en] tile overlay patch failed", result);
+      return false;
+    }
+
+    let blobUrl = "";
+    try {
+      const blob = new W.Blob([result.code], {
+        type: "text/javascript;charset=utf-8",
+      });
+      blobUrl = W.URL.createObjectURL(blob);
+    } catch (e) {
+      blobUrl =
+        "data:text/javascript;charset=utf-8," + encodeURIComponent(result.code);
+      pushClientError("Blob URL unavailable, used data URL: " + ((e && e.message) || e));
+    }
+    clientHook.blobUrl = blobUrl;
+    clientHook.patched = true;
+    if (DEBUG) {
+      W.console.log(
+        "%c[tenhou4-en] tile hooks applied:",
+        "color:#0a0;font-weight:bold",
+        result.applied.join(", "),
+        clientHook.finalUrl
+      );
+    }
+    return true;
+  }
+
+  function resolveClientUrl(value) {
+    const raw = String(value);
+    if (!isClientScriptUrl(raw)) return raw;
+    if (!clientHook.attempted) fetchAndPatch(raw);
+    return clientHook.patched && clientHook.blobUrl
+      ? clientHook.blobUrl
+      : raw;
+  }
+
+  function normalizeRect(r) {
+    if (!r) return null;
+    const x = Number(r.x);
+    const y = Number(r.y);
+    const w = Number(r.w != null ? r.w : r.width);
+    const hRaw = r.h != null ? r.h : r.i != null ? r.i : r.height;
+    const h = Number(hRaw);
+    if (![x, y, w, h].every((v) => Number.isFinite(v))) return null;
+    if (w <= 0 || h <= 0) return null;
+    return { x, y, w, h };
+  }
+
+  function intersects(a, b) {
+    return (
+      a.x < b.x + b.w &&
+      a.x + a.w > b.x &&
+      a.y < b.y + b.h &&
+      a.y + a.h > b.y
+    );
+  }
+
+  function parseDrawArgs(img, args) {
+    const n = args.length;
+    const iw = Number(img && (img.width || img.naturalWidth)) || 0;
+    const ih = Number(img && (img.height || img.naturalHeight)) || 0;
+    if (n >= 8) {
+      const sx = Number(args[0]), sy = Number(args[1]);
+      const sw = Number(args[2]), sh = Number(args[3]);
+      const dx = Number(args[4]), dy = Number(args[5]);
+      const dw = Number(args[6]), dh = Number(args[7]);
+      if (![sx, sy, sw, sh, dx, dy, dw, dh].every((v) => Number.isFinite(v))) {
+        return null;
+      }
+      if (sw <= 0 || sh <= 0) return null;
+      const scaleX = dw / sw;
+      const scaleY = dh / sh;
+      return normalizeRect({
+        x: dx - sx * scaleX,
+        y: dy - sy * scaleY,
+        w: (iw || sw) * scaleX,
+        h: (ih || sh) * scaleY,
+      });
+    }
+    if (n >= 4) {
+      return normalizeRect({ x: args[0], y: args[1], w: args[2], h: args[3] });
+    }
+    if (n >= 2) {
+      return normalizeRect({ x: args[0], y: args[1], w: iw, h: ih });
+    }
+    return null;
+  }
+
+  function isVisibleCanvas(canvas) {
+    if (!canvas || canvas.isConnected === false || isOverlayCanvas(canvas)) {
+      return false;
+    }
+    if (!(canvas.width > 0 && canvas.height > 0)) return false;
+    const now = Date.now();
+    const cached = visibilityCache.get(canvas);
+    if (cached && now - cached.ts < 250) return cached.value;
+    let visible = true;
+    try {
+      if (canvas.getClientRects && canvas.getClientRects().length === 0) {
+        visible = false;
+      }
+      const cs = W.getComputedStyle(canvas);
+      if (cs.display === "none" || cs.visibility === "hidden") visible = false;
+    } catch (e) {
+      visible = false;
+    }
+    visibilityCache.set(canvas, { value: visible, ts: now });
+    return visible;
+  }
+
+  function getOverlay(canvas) {
+    let rec = overlayRecords.get(canvas);
+    if (rec) return rec;
+    if (!canvas.parentNode) return null;
+
+    const overlay = D.createElement("canvas");
+    overlay.className = "tenhou4en-tile-overlay";
+    overlay.setAttribute("aria-hidden", "true");
+    const s = overlay.style;
+    s.position = "absolute";
+    s.left = "0";
+    s.top = "0";
+    s.pointerEvents = "none";
+    let cw = canvas.style.width;
+    let ch = canvas.style.height;
+    try {
+      const cs = W.getComputedStyle(canvas);
+      if (!cw) cw = cs.width;
+      if (!ch) ch = cs.height;
+    } catch (e) { }
+    s.width = cw || "100%";
+    s.height = ch || "100%";
+    canvas.parentNode.insertBefore(overlay, canvas.nextSibling);
+
+    rec = {
+      overlay,
+      labels: new Map(),
+      width: 0,
+      height: 0,
+      dirty: true,
+    };
+    overlayRecords.set(canvas, rec);
+    trackedCanvases.add(canvas);
+    tileOverlay.stats.overlays++;
+    return rec;
+  }
+
+  function syncOverlay(canvas, rec) {
+    const w = canvas.width | 0;
+    const h = canvas.height | 0;
+    if (w <= 0 || h <= 0) return false;
+    const o = rec.overlay;
+    if (o.width !== w || o.height !== h) {
+      o.width = w;
+      o.height = h;
+      rec.width = w;
+      rec.height = h;
+      rec.labels.clear();
+      rec.dirty = true;
+    }
+    let cw = canvas.style.width;
+    let ch = canvas.style.height;
+    try {
+      const cs = W.getComputedStyle(canvas);
+      if (!cw) cw = cs.width;
+      if (!ch) ch = cs.height;
+    } catch (e) { }
+    if (cw && o.style.width !== cw) o.style.width = cw;
+    if (ch && o.style.height !== ch) o.style.height = ch;
+    return true;
+  }
+
+  function clearOverlayRect(canvas, r) {
+    if (isOverlayCanvas(canvas)) return;
+    const rec = overlayRecords.get(canvas);
+    if (!rec) return;
+    syncOverlay(canvas, rec);
+    for (const [id, label] of rec.labels) {
+      if (intersects(label.rect, r)) rec.labels.delete(id);
+    }
+    const octx = rec.overlay.getContext("2d");
+    if (octx) octx.clearRect(r.x, r.y, r.w, r.h);
+    rec.dirty = true;
+  }
+
+  function resetCanvas(canvas) {
+    if (isOverlayCanvas(canvas)) return;
+    visibilityCache.delete(canvas);
+    const rec = overlayRecords.get(canvas);
+    if (!rec) return;
+    rec.labels.clear();
+    rec.dirty = true;
+    const octx = rec.overlay.getContext("2d");
+    if (octx) octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
+  }
+
+  function addTileLabel(key, rawRect, canvas) {
+    if (!canvas || isOverlayCanvas(canvas) || !isVisibleCanvas(canvas)) return;
+    const rect = normalizeRect(rawRect);
+    if (!rect) return;
+    const k = Number(key);
+    if (!Number.isFinite(k)) return;
+    const code = (k >>> 16) & 255;
+    if (SKIP_CODES.has(code)) return;
+    const name = TILE_LABELS[code];
+    if (!name) return;
+    const rec = getOverlay(canvas);
+    if (!rec) return;
+    const id = (k & 0xffffff) >>> 0;
+    rec.labels.set(id, {
+      key: k,
+      code,
+      name,
+      aka: AKA_CODES.has(code),
+      rect,
+    });
+    rec.dirty = true;
+    tileOverlay.stats.labels++;
+    if (DEBUG && tileOverlay.stats.labels <= 8) {
+      W.console.log(
+        "[tenhou4-en] tile label",
+        name,
+        "code=" + code,
+        "@" + Math.round(rect.x) + "," + Math.round(rect.y)
+      );
+    }
+  }
+
+  function drawLabel(ctx, label) {
+    const r = label.rect;
+    ctx.save();
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    let fontSize = Math.max(5, Math.min(r.w * 0.42, r.h * 0.34, 20));
+    const setFont = () => {
+      ctx.font = '700 ' + fontSize + 'px "Segoe UI", Arial, sans-serif';
+    };
+    const padX = () => Math.max(1, fontSize * 0.2);
+    const padY = () => Math.max(1, fontSize * 0.14);
+    setFont();
+    let textW = ctx.measureText(label.name).width;
+    const maxW = r.w - padX() * 2 - 1;
+    if (maxW > 0 && textW > maxW) {
+      fontSize = Math.max(4, Math.floor((fontSize * maxW) / textW));
+      setFont();
+      textW = ctx.measureText(label.name).width;
+    }
+    const boxW = textW + padX() * 2;
+    const boxH = fontSize + padY() * 2;
+    const x = r.x + Math.max(1, r.w * 0.04);
+    const y = r.y + Math.max(1, r.h * 0.04);
+    ctx.lineWidth = Math.max(0.5, fontSize * 0.06);
+    ctx.fillStyle = label.aka
+      ? "rgba(190,25,25,0.9)"
+      : "rgba(255,255,255,0.88)";
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.shadowColor = "rgba(0,0,0,0.3)";
+    ctx.shadowBlur = 2;
+    ctx.fillRect(x, y, boxW, boxH);
+    ctx.shadowBlur = 0;
+    ctx.strokeRect(x, y, boxW, boxH);
+    ctx.fillStyle = label.aka ? "#fff" : "#111";
+    ctx.fillText(label.name, x + padX(), y + padY());
+    ctx.restore();
+  }
+
+  function renderFrame() {
+    for (const canvas of Array.from(trackedCanvases)) {
+      const rec = overlayRecords.get(canvas);
+      if (!rec) {
+        trackedCanvases.delete(canvas);
+        continue;
+      }
+      if (!canvas.isConnected || !isVisibleCanvas(canvas)) {
+        rec.labels.clear();
+        const octx = rec.overlay.getContext("2d");
+        if (octx) octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
+        rec.dirty = false;
+        continue;
+      }
+      if (!syncOverlay(canvas, rec)) continue;
+      if (!rec.dirty) continue;
+      const octx = rec.overlay.getContext("2d");
+      if (!octx) continue;
+      octx.clearRect(0, 0, rec.overlay.width, rec.overlay.height);
+      for (const label of rec.labels.values()) drawLabel(octx, label);
+      rec.dirty = false;
+    }
+    raf(renderFrame);
+  }
+
+  function installCanvasHooks() {
+    W.__tenhou4enTileDraw = addTileLabel;
+    window.__tenhou4enTileDraw = addTileLabel;
+
+    const drawDesc = Object.getOwnPropertyDescriptor(CRC2D.prototype, "drawImage");
+    if (drawDesc && drawDesc.value && drawDesc.configurable) {
+      const nativeDrawImage = drawDesc.value;
+      Object.defineProperty(CRC2D.prototype, "drawImage", {
+        configurable: true,
+        enumerable: drawDesc.enumerable,
+        writable: true,
+        value: function (img) {
+          const res = nativeDrawImage.apply(this, arguments);
+          try {
+            if (!img || img.__tenhou4enTileKey == null) return res;
+            const canvas = this.canvas;
+            if (!canvas || !isVisibleCanvas(canvas)) return res;
+            const args = Array.prototype.slice.call(arguments, 1);
+            const rect = parseDrawArgs(img, args);
+            if (!rect) return res;
+            tileOverlay.stats.draws++;
+            addTileLabel(img.__tenhou4enTileKey, rect, canvas);
+          } catch (e) {
+            recordError(e);
+          }
+          return res;
+        },
+      });
+    } else {
+      pushClientError("drawImage descriptor unavailable");
+    }
+
+    const clearDesc = Object.getOwnPropertyDescriptor(CRC2D.prototype, "clearRect");
+    if (clearDesc && clearDesc.value && clearDesc.configurable) {
+      const nativeClearRect = clearDesc.value;
+      Object.defineProperty(CRC2D.prototype, "clearRect", {
+        configurable: true,
+        enumerable: clearDesc.enumerable,
+        writable: true,
+        value: function (x, y, w, h) {
+          const res = nativeClearRect.apply(this, arguments);
+          try {
+            const canvas = this.canvas;
+            if (!canvas || isOverlayCanvas(canvas) || !isVisibleCanvas(canvas)) {
+              return res;
+            }
+            const r = normalizeRect({ x, y, w, h });
+            if (!r) return res;
+            tileOverlay.stats.clears++;
+            clearOverlayRect(canvas, r);
+          } catch (e) {
+            recordError(e);
+          }
+          return res;
+        },
+      });
+    } else {
+      pushClientError("clearRect descriptor unavailable");
+    }
+
+    for (const prop of ["width", "height"]) {
+      const desc = Object.getOwnPropertyDescriptor(HCE.prototype, prop);
+      if (!desc || !desc.set || !desc.configurable) {
+        pushClientError(prop + " descriptor unavailable");
+        continue;
+      }
+      Object.defineProperty(HCE.prototype, prop, {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get() {
+          return desc.get.call(this);
+        },
+        set(v) {
+          const res = desc.set.call(this, v);
+          try {
+            if (!isOverlayCanvas(this)) resetCanvas(this);
+          } catch (e) {
+            recordError(e);
+          }
+          return res;
+        },
+      });
+    }
+  }
+
+  function installScriptHooks() {
+    const srcDesc = Object.getOwnPropertyDescriptor(HSE.prototype, "src");
+    if (srcDesc && srcDesc.set && srcDesc.configurable) {
+      Object.defineProperty(HSE.prototype, "src", {
+        configurable: true,
+        enumerable: srcDesc.enumerable,
+        get() {
+          return srcDesc.get.call(this);
+        },
+        set(value) {
+          return srcDesc.set.call(this, resolveClientUrl(value));
+        },
+      });
+    } else {
+      pushClientError("HTMLScriptElement.src descriptor unavailable");
+    }
+
+    const setAttrDesc = Object.getOwnPropertyDescriptor(ELEM.prototype, "setAttribute");
+    if (setAttrDesc && setAttrDesc.value && setAttrDesc.configurable) {
+      const nativeSetAttribute = setAttrDesc.value;
+      Object.defineProperty(ELEM.prototype, "setAttribute", {
+        configurable: true,
+        enumerable: setAttrDesc.enumerable,
+        writable: true,
+        value: function (name, value) {
+          const lname = String(name).toLowerCase();
+          const tag = this.tagName ? this.tagName.toUpperCase() : "";
+          if (tag === "SCRIPT" && lname === "src") {
+            return nativeSetAttribute.call(this, name, resolveClientUrl(value));
+          }
+          const result = nativeSetAttribute.call(this, name, value);
+          if (tag === "CANVAS" && (lname === "width" || lname === "height")) {
+            try {
+              if (!isOverlayCanvas(this)) resetCanvas(this);
+            } catch (e) {
+              recordError(e);
+            }
+          }
+          return result;
+        },
+      });
+    } else {
+      pushClientError("Element.setAttribute descriptor unavailable");
+    }
+  }
+
+  function installTileOverlay() {
+    if (!IS_DESKTOP4K) {
+      clientHook.disabledReason = "not a /4/ page";
+      return;
+    }
+    if (!CAN_HOOK) {
+      pushClientError("required DOM constructors missing; tile overlay disabled");
+      if (DEBUG) {
+        W.console.warn("[tenhou4-en] tile overlay: DOM constructors missing");
+      }
+      return;
+    }
+    installCanvasHooks();
+    installScriptHooks();
+    raf(renderFrame);
+    if (DEBUG) {
+      W.console.log(
+        "%c[tenhou4-en] tile overlay installed (compact, always on)",
+        "color:#0a0;font-weight:bold"
+      );
+    }
+  }
+
+  installTileOverlay();
+
   // ---------------------------------------------------------------- language
   try {
-    localStorage.setItem("lang", "en");
+    W.localStorage.setItem("lang", "en");
   } catch (e) { }
 
   // ------------------------------------------------------- string table patch
+
   const LANG_URL_RE = /\/res\/lang\/string\d+_en\.json(?:[?#]|$)/;
 
   const TABLE_OVERRIDES = {
@@ -105,7 +818,7 @@
     return obj;
   }
 
-  const XHR = XMLHttpRequest.prototype;
+  const XHR = W.XMLHttpRequest.prototype;
   const nativeOpen = XHR.open;
 
   XHR.open = function (method, url) {
@@ -663,62 +1376,10 @@
   if (document.documentElement) start();
   else document.addEventListener("DOMContentLoaded", start, { once: true });
 
-  // ===============================================================
-  // TILE OVERLAY  (Majsoul-style indices)
-  // ===============================================================
-
-  let tilesEnabled = true;
-  try {
-    const v = localStorage.getItem("tenhou4enTiles");
-    if (v === "0") tilesEnabled = false;
-  } catch (e) { }
-
-  // Inject CSS for the overlay
-  const style = document.createElement("style");
-  style.textContent = `
-    .tenhou4en-tile-label {
-      position: absolute;
-      top: 2px;
-      left: 2px;
-      font-family: "Segoe UI", "Arial", sans-serif;
-      font-weight: 700;
-      font-size: 13px;
-      line-height: 1;
-      color: #111;
-      background: rgba(255,255,255,0.82);
-      border-radius: 3px;
-      padding: 1px 3px;
-      pointer-events: none;
-      z-index: 20;
-      text-shadow: 0 0 2px #fff;
-      box-shadow: 0 0 1px rgba(0,0,0,0.4);
-    }
-    .tenhou4en-tile-label.aka {
-      color: #c00;
-      background: rgba(255,230,230,0.9);
-    }
-    .tenhou4en-tile-label.honor {
-      font-size: 12px;
-    }
-  `;
-  document.documentElement.appendChild(style);
-
-  // Simple hotkey: Ctrl+Shift+T
-  window.addEventListener("keydown", (e) => {
-    if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") {
-      tilesEnabled = !tilesEnabled;
-      try {
-        localStorage.setItem("tenhou4enTiles", tilesEnabled ? "1" : "0");
-      } catch (err) { }
-      document.querySelectorAll(".tenhou4en-tile-label").forEach((el) => {
-        el.style.display = tilesEnabled ? "" : "none";
-      });
-      console.log("[tenhou4-en] Tile overlay:", tilesEnabled ? "ON" : "OFF");
-    }
-  });
+  // Tile overlay hooks are installed above, before /4/latest.js loads.
 
   // Debug helper
-  window.__tenhou4en = {
+  const debugApi = {
     yaku: YAKU,
     ranks: RANKS,
     misc: MISC,
@@ -727,17 +1388,7 @@
     translateString,
     translateTextNode,
     walk,
-    tilesEnabled: () => tilesEnabled,
-    toggleTiles() {
-      tilesEnabled = !tilesEnabled;
-      try {
-        localStorage.setItem("tenhou4enTiles", tilesEnabled ? "1" : "0");
-      } catch (e) { }
-      document.querySelectorAll(".tenhou4en-tile-label").forEach((el) => {
-        el.style.display = tilesEnabled ? "" : "none";
-      });
-      return tilesEnabled;
-    },
+    tileOverlay,
     add(ja, en) {
       EXACT[ja] = en;
       walk(document.body);
@@ -753,9 +1404,17 @@
       return [...found];
     },
   };
+  W.__tenhou4en = debugApi;
+  window.__tenhou4en = debugApi;
 
   console.log(
-    "%c[tenhou4-en] v0.2.0 loaded — Ctrl+Shift+T toggles tile overlay",
+    "%c[tenhou4-en] v0.3.0 loaded - compact English tile names are always on" +
+    (IS_DESKTOP4K ? "" : " (tile overlay: /4 only)"),
     "color:#0a0;font-weight:bold"
   );
+  if (DEBUG && IS_DESKTOP4K) {
+    console.log(
+      "[tenhou4-en] verify tile hooks with: __tenhou4en.tileOverlay.report()"
+    );
+  }
 })();
