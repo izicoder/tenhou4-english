@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.1.0
+// @version      0.1.2
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K) and translates the Japanese the official EN option leaves behind.
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -304,6 +304,28 @@
     "以下": "or below",
     "点": "pts",
     "枚": "tiles",
+    // Limit hands and result-screen terms.  Tenhou uses the traditional
+    // forms (滿 / 數 / 役滿); the simplified forms are kept as a fallback.
+    "滿貫": "Mangan",
+    "跳滿": "Haneman",
+    "倍滿": "Baiman",
+    "三倍滿": "Sanbaiman",
+    "役滿": "Yakuman",
+    "數え役滿": "Kazoe Yakuman",
+    "數え役満": "Kazoe Yakuman",
+    "満貫": "Mangan",
+    "跳満": "Haneman",
+    "倍満": "Baiman",
+    "三倍満": "Sanbaiman",
+    "役満": "Yakuman",
+    "数え役満": "Kazoe Yakuman",
+    "終局": "Game Over",
+    "供託": "Riichi Sticks",
+    "荒牌平局": "Exhaustive Draw",
+    "順位": "Rank",
+    "段位": "Dan Rank",
+    "聴牌": "Tenpai",
+    "不聴": "Noten",
     // Lobby / room selection.
     "準備中": "Loading...",
     "四麻:": "4-player:",
@@ -441,6 +463,37 @@
       return true;
     }
 
+    return false;
+  }
+
+  let RANK_WORDS = null;
+  function rankWords() {
+    if (!RANK_WORDS) {
+      RANK_WORDS = new Set([...Object.keys(RANKS), ...Object.values(RANKS)]);
+    }
+    return RANK_WORDS;
+  }
+
+  // Result dialog: the seat wind is a lone text node before the player name,
+  // e.g. [西][ COM][25000][-2600].  Translate it only when it is the first
+  // text of a box that also shows a score, so a bare 東 elsewhere is safe.
+  function translateResultSeat(node) {
+    const text = node.nodeValue.trim();
+    if (!WIND[text]) return false;
+
+    let box = node.parentElement;
+    for (let i = 0; i < 3 && box; i++, box = box.parentElement) {
+      const nodes = childTextNodes(box).filter((n) => originalValue(n).trim());
+      if (!nodes.length || nodes[0] !== node) continue;
+      const joined = nodes.map(originalValue).join(" ");
+      // Result dialog: a score follows.  Match-start dialog: a rank follows
+      // (東 / 新人 / COM).  Either way the wind is the first text of its box.
+      const nextText = nodes[1] ? originalValue(nodes[1]).trim() : "";
+      if (/\d{4,6}/.test(joined) || rankWords().has(nextText)) {
+        setNodeValue(node, WIND[text] + " ");
+        return true;
+      }
+    }
     return false;
   }
 
@@ -697,6 +750,9 @@
     // In-game round / seat panel (nested spans inside div.nopp).
     if (translateNoppContainer(node)) return;
 
+    // Result dialog seat winds (西 COM 25000 -2600).
+    if (translateResultSeat(node)) return;
+
     // Round text is split across sibling nodes; handle it at the parent level.
     if (translateRoundParent(node)) return;
 
@@ -784,6 +840,8 @@
     translateTextNode,
     translateContext,
     translateNoppContainer,
+    translateResultSeat,
+    rankWords,
     translateRoundParent,
     translateSplitCounter,
     walk,

@@ -315,12 +315,14 @@ async function closeOverlay(page) {
     const report = [];
     await capture(page, "lobby", report);
 
-    // Top tabs.
+    // Lobby tabs (Mo = mail/message, To = tournament, WA = watch, LO = lobby,
+    // TO = tools).  PL is the default and is captured above.
     for (const label of ["Mo", "To", "WA", "LO", "TO"]) {
       if (!(await clickText(page, new RegExp(`^${label}$`)))) continue;
       await page.waitForTimeout(1200);
       await capture(page, `lobby-tab-${label}`, report);
     }
+    await clickText(page, /^PL$/);
 
     // Room tiers.
     for (const label of ["Ge", "Ad", "Ex", "Ph"]) {
@@ -329,7 +331,7 @@ async function closeOverlay(page) {
       await capture(page, `lobby-room-${label}`, report);
     }
 
-    // Settings gear: the unlabelled button next to the language selector.
+    // Settings popup: the unlabelled gear button top-right.
     const gear = await page.evaluate((vis) => {
       const visible = eval(vis);
       const el = [...document.querySelectorAll("button, [onclick]")].find((e) => {
@@ -344,30 +346,35 @@ async function closeOverlay(page) {
     await page.waitForTimeout(1500);
     await capture(page, "settings", report);
 
-    // Settings tabs.
-    const tabs = await page.evaluate((vis) => {
-      const visible = eval(vis);
-      return [
-        ...new Set(
-          [...document.querySelectorAll("label, button, .btn")]
-            .filter((el) => visible(el) && el.childElementCount <= 1)
-            .map((el) => (el.textContent || "").trim())
-            .filter((t) => t && t.length <= 12)
-        ),
-      ];
-    }, visibleFn);
-    console.log("[settings] tabs:", JSON.stringify(tabs));
-    for (const label of tabs) {
-      if (/^(OK|Close|CANCEL|×)$/i.test(label)) continue;
-      if (!(await clickText(page, new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)))) continue;
+    // Settings tabs, by their English abbreviations.
+    for (const label of ["Ta", "Ti", "SE", "UI", "Vi", "Ot"]) {
+      if (!(await clickText(page, new RegExp(`^${label}$`)))) continue;
       await page.waitForTimeout(900);
       await capture(page, `settings-${label}`, report);
     }
-    await closeOverlay(page);
+
+    // Close the settings popup by clicking the gear again.
+    await page.evaluate((vis) => {
+      const visible = eval(vis);
+      const el = [...document.querySelectorAll("button, [onclick]")].find((e) => {
+        const cls = typeof e.className === "string" ? e.className : "";
+        return visible(e) && /\b(adr|c66)\b/.test(cls);
+      });
+      if (el) el.click();
+    }, visibleFn);
+    await page.waitForTimeout(800);
+
+    // Game-select dropdown on the lobby.
+    if (await clickText(page, /^SELECT GAME/)) {
+      await page.waitForTimeout(1000);
+      await capture(page, "game-select", report);
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(600);
+    }
 
     // Match start via TEST PLAY.
     if (await clickText(page, /^TEST PLAY/)) {
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
       await capture(page, "match-start", report);
       await closeOverlay(page);
     }
