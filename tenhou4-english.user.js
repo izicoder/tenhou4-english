@@ -366,6 +366,11 @@
     }
     if (root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
 
+    if (root.nodeType === 1) {
+      const tag = root.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return;
+    }
+
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     let n;
     while ((n = walker.nextNode())) translateTextNode(n);
