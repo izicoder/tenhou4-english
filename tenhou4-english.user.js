@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.5.0
+// @version      0.5.1
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -48,7 +48,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.5.0";
+  const VERSION = "0.5.1";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -758,6 +758,8 @@
     return false;
   }
 
+  const PLAYER_SCORE_LINE_RE = /^[A-D]:.*\([+-]?\d+(?:\.\d)?\)$/;
+
   function translateTextNode(node) {
     const raw = node.nodeValue;
     if (!raw) return;
@@ -814,6 +816,9 @@
       node.nodeValue = raw.slice(0, i) + out + raw.slice(i + text.length);
       return;
     }
+
+    // "D:name(-21.0)" lines of the final score table carry player names.
+    if (PLAYER_SCORE_LINE_RE.test(text)) return;
 
     if (DEBUG && /[\u3040-\u30ff\u4e00-\u9fff]/.test(text) && !seenUnknown.has(text)) {
       seenUnknown.add(text);
@@ -922,6 +927,7 @@
     putWrapped: false,
     buffers: 0,
     records: 0,
+    rawInflates: 0,
     inflates: 0,
     jobs: 0,
     labeled: 0,
@@ -930,16 +936,17 @@
   };
 
   // Per (sheet, slot, seat): the union of the artwork rects of all faces, so
-  // every tile in a slot gets its label at the same spot.
-  const GROUPS = new Map();
-  function noteGroup(rec) {
+  // every tile in a slot gets its label at the same spot.  One map per parsed
+  // file: after a window resize the client reloads the sprites at another
+  // resolution, and those coordinates must never mix with the old ones.
+  function noteGroup(groups, rec) {
     const face = (rec.key >>> 16) & 255;
     if (face === 34 || face > 36 || rec.w <= 0 || rec.i <= 0) return;
     const gk = (rec.key & 0xff00ffff) >>> 0;
-    let g = GROUPS.get(gk);
+    let g = groups.get(gk);
     if (!g) {
       g = { u: { x0: rec.x, y0: rec.y, x1: rec.x + rec.w, y1: rec.y + rec.i } };
-      GROUPS.set(gk, g);
+      groups.set(gk, g);
       return;
     }
     g.u.x0 = Math.min(g.u.x0, rec.x);
@@ -962,8 +969,8 @@
     );
   }
 
-  // Replica of the obj* branch of sc.kc().  Returns Map(dataOffset -> record)
-  // for tile sheets, or null when the buffer is not an obj file.
+  // Replica of the obj* branch of sc.kc().  Returns { byOffset: Map(dataOffset
+  // -> record), groups } for tile sheets, or null when it is not an obj file.
   function parseObjBuffer(buf) {
     if (!buf || typeof buf.byteLength !== "number" || buf.byteLength < 28) return null;
     const dv = new DataView(buf);
@@ -974,6 +981,7 @@
     let p = 12;
     if (magic === 829055599 || magic === 862610031) p += 12; // 3 floats
     const byOffset = new Map();
+    const groups = new Map();
     const end = Math.min(structSize, buf.byteLength);
     for (let a = p; a + 4 <= end; a += 4) {
       const m = dv.getUint32(a, true);
@@ -988,23 +996,23 @@
         key,
         dc: dv.getUint32(m + 16, true),
       };
-      noteGroup(rec);
+      noteGroup(groups, rec);
       byOffset.set(m + 20, rec);
     }
     tileStats.buffers++;
     tileStats.records += byOffset.size;
-    return byOffset;
+    return { byOffset, groups };
   }
 
   const BUF_TABLES = new WeakMap();
   let curSprite = null; // { base, face } for the sprite being decoded
   let pendingJob = null; // label waiting for the next putImageData()
 
-  function makeJob(base, face) {
+  function makeJob(base, face, groups) {
     const faceId = (face.key >>> 16) & 255;
     if (faceId > 36) return null; // back / shadow variants get no label
     let rect = null;
-    const grp = GROUPS.get((face.key & 0xff00ffff) >>> 0);
+    const grp = groups && groups.get((face.key & 0xff00ffff) >>> 0);
     if (grp) {
       const u = grp.u;
       const r = { x: u.x0 - base.x, y: u.y0 - base.y, w: u.x1 - u.x0, h: u.y1 - u.y0 };
@@ -1033,26 +1041,28 @@
 
   function onInflate(u8) {
     if (!u8 || !u8.buffer) return;
+    tileStats.rawInflates++;
     let tab = BUF_TABLES.get(u8.buffer);
     if (tab === undefined) {
       tab = parseObjBuffer(u8.buffer);
       BUF_TABLES.set(u8.buffer, tab);
     }
     if (!tab) return;
-    const rec = tab.get(u8.byteOffset);
+    const rec = tab.byOffset.get(u8.byteOffset);
     if (!rec) return;
     tileStats.inflates++;
 
     const face = (rec.key >>> 16) & 255;
     if (face === 38 || face === 39) {
       // Shadow record: always the last inflate of one sprite decode.
-      pendingJob = curSprite ? makeJob(curSprite.base, curSprite.face) : null;
+      pendingJob = curSprite ? makeJob(curSprite.base, curSprite.face, curSprite.groups) : null;
       if (pendingJob) tileStats.jobs++;
       curSprite = null;
     } else if (face === 34 || face === 37) {
-      curSprite = { base: rec, face: rec }; // a new decode starts at its base
+      curSprite = { base: rec, face: rec, groups: tab.groups }; // a new decode starts at its base
     } else if (curSprite) {
       curSprite.face = rec;
+      curSprite.groups = tab.groups; // the face file's resolution wins
     }
   }
 
@@ -1115,6 +1125,20 @@
     return Z;
   }
 
+  // If Tenhou ships a new client the sprite files may change shape.  Say so
+  // once, instead of leaving the user with silently missing labels.
+  function tileHealthMessage() {
+    if (!tileStats.zlibWrapped) return "Zlib was not found, so tile labels cannot work.";
+    if (!tileStats.putWrapped) return "putImageData could not be hooked.";
+    if (tileStats.rawInflates > 20 && tileStats.buffers === 0) {
+      return "sprite files were not recognised (Tenhou may have updated its client).";
+    }
+    if (tileStats.inflates > 0 && tileStats.labeled === 0) {
+      return "tiles were decoded but no label was drawn (" + JSON.stringify(tileStats) + ").";
+    }
+    return "";
+  }
+
   function installTileHooks() {
     if (!TILES_ENABLED) return;
     if (String(location.pathname).indexOf("/4/") !== 0) return;
@@ -1163,11 +1187,27 @@
     }
     if (zlib) zlib = wrapZlib(zlib);
 
+    let warned = false;
+    let healthRuns = 0;
+    const healthTimer = setInterval(() => {
+      const msg = tileHealthMessage();
+      if (msg && !warned) {
+        warned = true;
+        console.warn(
+          "[tenhou4-en] Tile labels are not working: " + msg +
+          "  Run __tenhou4en.tiles.stats() and report the output."
+        );
+      }
+      if (warned || tileStats.labeled > 5 || ++healthRuns >= 10) clearInterval(healthTimer);
+    }, 30000);
+    if (healthTimer && typeof healthTimer.unref === "function") healthTimer.unref();
+
     let tries = 0;
     const timer = setInterval(() => {
       if (window.Zlib && window.Zlib.Inflate && !window.Zlib.Inflate.__t4en) wrapZlib(window.Zlib);
       if (tileStats.zlibWrapped || ++tries > 600) clearInterval(timer);
     }, 100);
+    if (timer && typeof timer.unref === "function") timer.unref();
   }
 
   const tilesApi = {
@@ -1199,7 +1239,7 @@
       }
       console.log("[tenhou4-en] tile label offset set - reload the page");
     },
-    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText },
+    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText, tileHealthMessage },
   };
   // </tiles>
 
