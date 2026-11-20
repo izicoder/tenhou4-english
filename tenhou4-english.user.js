@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.5.1
+// @version      0.5.2
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -48,7 +48,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.5.1";
+  const VERSION = "0.5.2";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -939,6 +939,12 @@
   // every tile in a slot gets its label at the same spot.  One map per parsed
   // file: after a window resize the client reloads the sprites at another
   // resolution, and those coordinates must never mix with the old ones.
+  // The blank base tiles and the printed faces come from different sprite
+  // files, so a base-only decode (the white dragon has no printed face) must
+  // look the union up in the face file.  Keep the few newest maps; a resize
+  // pushes the new resolution last, and an old map must also pass the bounds
+  // check in makeJob() to be used.
+  const RECENT_GROUPS = [];
   function noteGroup(groups, rec) {
     const face = (rec.key >>> 16) & 255;
     if (face === 34 || face > 36 || rec.w <= 0 || rec.i <= 0) return;
@@ -999,6 +1005,10 @@
       noteGroup(groups, rec);
       byOffset.set(m + 20, rec);
     }
+    if (groups.size) {
+      RECENT_GROUPS.push(groups);
+      if (RECENT_GROUPS.length > 4) RECENT_GROUPS.shift();
+    }
     tileStats.buffers++;
     tileStats.records += byOffset.size;
     return { byOffset, groups };
@@ -1012,12 +1022,19 @@
     const faceId = (face.key >>> 16) & 255;
     if (faceId > 36) return null; // back / shadow variants get no label
     let rect = null;
-    const grp = groups && groups.get((face.key & 0xff00ffff) >>> 0);
-    if (grp) {
+    const gk = (face.key & 0xff00ffff) >>> 0;
+    const maps = groups ? [groups] : [];
+    for (let i = RECENT_GROUPS.length - 1; i >= 0; i--) {
+      if (RECENT_GROUPS[i] !== groups) maps.push(RECENT_GROUPS[i]);
+    }
+    for (const gm of maps) {
+      const grp = gm.get(gk);
+      if (!grp) continue;
       const u = grp.u;
       const r = { x: u.x0 - base.x, y: u.y0 - base.y, w: u.x1 - u.x0, h: u.y1 - u.y0 };
       if (r.w > 0 && r.h > 0 && r.x >= -1 && r.y >= -1 && r.x + r.w <= base.w + 1 && r.y + r.h <= base.i + 1) {
         rect = r;
+        break;
       }
     }
     if (!rect && face !== base) {
