@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.5.2
+// @version      0.5.3
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -48,7 +48,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.5.2";
+  const VERSION = "0.5.3";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -758,6 +758,69 @@
     return false;
   }
 
+  // <names>
+  // Player names are user content, never UI text.  A player called "ドラ" or
+  // "平和" must not become "Dora" / "Pinfu".  The game announces the names in
+  // WebSocket messages (UN: n0..n3, URL-encoded; HELO: uname; CHAT: uname), so
+  // we listen for those and remember them.
+  const PLAYER_NAMES = new Set();
+
+  function learnNames(data) {
+    if (typeof data !== "string" || data.length > 20000 || data.charCodeAt(0) !== 123) return;
+    let d;
+    try {
+      d = JSON.parse(data);
+    } catch (e) {
+      return;
+    }
+    if (!d || typeof d !== "object") return;
+    const add = (v) => {
+      if (typeof v !== "string" || !v) return;
+      try {
+        v = decodeURIComponent(v);
+      } catch (e) {
+        /* keep the raw value */
+      }
+      v = v.trim();
+      if (v && PLAYER_NAMES.size < 500) PLAYER_NAMES.add(v);
+    };
+    if (d.tag === "UN") {
+      for (let i = 0; i < 4; i++) add(d["n" + i]);
+    } else if (d.tag === "HELO" || d.tag === "CHAT") {
+      add(d.uname);
+    }
+  }
+
+  // True when this text node is a player name.  Yaku cells (.ym / .yk) are
+  // exempt so a player named "平和" cannot stop the yaku "平和" being translated.
+  function isProtectedName(raw, el) {
+    if (!PLAYER_NAMES.size) return false;
+    const t = String(raw).trim();
+    if (!t || !PLAYER_NAMES.has(t)) return false;
+    return !(el && el.closest && el.closest(".ym, .yk"));
+  }
+
+  function installNameTracker() {
+    const WS = window.WebSocket;
+    if (typeof WS !== "function" || WS.__t4en || typeof Proxy !== "function") return;
+    window.WebSocket = new Proxy(WS, {
+      construct(target, args) {
+        const ws = new target(...args);
+        try {
+          ws.addEventListener("message", (e) => learnNames(e.data));
+        } catch (e) {
+          /* never break the game's connection */
+        }
+        return ws;
+      },
+      get(target, key) {
+        return key === "__t4en" ? true : Reflect.get(target, key, target);
+      },
+    });
+  }
+  // </names>
+  installNameTracker();
+
   const PLAYER_SCORE_LINE_RE = /^[A-D]:.*\([+-]?\d+(?:\.\d)?\)$/;
 
   function translateTextNode(node) {
@@ -781,6 +844,9 @@
     ) {
       return;
     }
+
+    // A player whose name is also a game term stays exactly as typed.
+    if (isProtectedName(raw, pel)) return;
 
     // Context-only labels (single-character lobby tabs).
     if (translateContext(node)) return;
@@ -1266,6 +1332,7 @@
 
   window.__tenhou4en = {
     version: VERSION,
+    playerNames: () => [...PLAYER_NAMES],
     tiles: tilesApi,
     yaku: YAKU,
     ranks: RANKS,
