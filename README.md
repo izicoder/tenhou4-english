@@ -14,7 +14,7 @@ It runs inside your browser and only changes what you see. It does not modify th
 1. Install a userscript manager: [Violentmonkey](https://violentmonkey.github.io/) or [Tampermonkey](https://www.tampermonkey.net/).
    On recent Chrome and Edge you may also have to enable **Developer mode** (or "Allow user scripts") for the extension.
 2. Open [`tenhou4-english.user.js`](tenhou4-english.user.js), click **Raw**, and confirm the install.
-3. Open <https://tenhou.net/4/>. The console (F12) should print `[tenhou4-en] vX.Y.Z loaded`.
+3. Open <https://tenhou.net/4/>. You should see a small gear button in the top-left corner (the settings panel).
 
 **Run only one Tenhou /4 userscript at a time.** If a second copy (or another script that does the same job) is enabled, one of them silently bows out and logs a warning.
 
@@ -35,14 +35,29 @@ Every face-up tile gets a small coloured chip on its face: your hand, all discar
 
 ### Settings
 
-There is no settings screen yet. Run these in the browser console (F12), then reload the page:
+Click the small **gear button in the top-left corner** (or press **Alt+T**) to open the settings panel:
+
+- **Show labels**: switch the tile labels on or off.
+- **Position**: top-left corner of the tile (default) or centre of the tile.
+- **Size**, **Left / right**, **Up / down**: make the chips bigger or smaller and nudge them.
+- **Reset**: back to the defaults.
+- **Reload page**: new tiles use your settings immediately, but tiles already on screen keep their old look until the page is reloaded. Reload between games.
+- **Copy bug report**: copies the version, your settings, some counters and any Japanese still on screen to the clipboard, ready to paste into an issue. Player names are left out.
+
+The panel also tells you whether the tile labels are working. Settings are saved in your browser.
+
+<details>
+<summary>Console commands (optional)</summary>
 
 ```js
-__tenhou4en.tiles.setPosition("c");     // centre the chip on the tile ("tl" = top-left, default)
-__tenhou4en.tiles.setOffset(0.05, 0);   // nudge by a fraction of the tile face (right, down)
-__tenhou4en.tiles.setEnabled(false);    // turn the labels off (true = on)
-__tenhou4en.tiles.stats();              // counters, useful for bug reports
+__tenhou4en.tiles.setPosition("c");     // "tl" or "c"
+__tenhou4en.tiles.setScale(1.4);        // 0.5 - 2
+__tenhou4en.tiles.setOffset(0.05, 0);   // fractions of the tile face, -0.5 - 0.5
+__tenhou4en.tiles.setEnabled(false);
+__tenhou4en.tiles.stats();              // counters
 ```
+
+</details>
 
 ## Translation
 
@@ -72,17 +87,17 @@ If you find one, please open an issue with the Japanese text and a screenshot of
 
 - The event notice on the start screen (`/ads/eventinfo.js`) changes every week and stays in Japanese. The banner images are pictures and cannot be translated.
 - Only the static strings of the `/man/` manual and the `/reg/` purchase page are translated, not the manual's long prose.
-- Settings are console commands, not a menu.
 - Replays: tile labels work, but player names in replays are not learned, so a name that equals a game term could be translated there.
 
 ## Troubleshooting
 
 - **Nothing is translated**: check that the script is enabled and that no second copy is running. The console should show the `loaded` line.
-- **Labels missing or in the wrong place**: run `__tenhou4en.tiles.stats()` and look at the numbers. After about 30 seconds of play the script prints a warning on its own if it detects that the labels cannot work, for example after Tenhou updates its client. Please include the stats output in a bug report.
-- **Labels look slightly off**: try `setPosition("c")` or `setOffset(...)` above.
+- **Labels missing or in the wrong place**: open the settings panel; its status line says whether the labels are working. If Tenhou updates its client the labels may stop working, and the panel (and, after about 30 seconds of play, the console) will say so. Please use **Copy bug report** and open an issue.
+- **Labels look slightly off**: open the settings panel and try the position, size and nudge controls.
 
 ## How it works
 
+- **Settings panel:** a small shadow-DOM widget, so the page's own styles cannot affect it and the game's mouse and key handlers never see clicks inside it.
 - **Strings:** the page's `XMLHttpRequest` is wrapped just enough to merge our overrides into the English string table before the client reads it. A `MutationObserver` translates the remaining hard-coded text as it appears, by exact match or anchored pattern.
 - **Tiles:** tiles are canvas sprites decoded on demand from the client's `obj*.dat` files. The script watches `Zlib.Inflate` to learn which tile face a sprite is being decoded for and draws the chip onto that sprite right after `putImageData()`. No client code is rewritten and no extra canvas is added.
 

@@ -2,7 +2,7 @@
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
 // @namespace    https://github.com/local/tenhou4-english
-// @version      0.5.3
+// @version      0.6.0
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
 // @author       you
 // @match        https://tenhou.net/4/*
@@ -48,7 +48,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.5.3";
+  const VERSION = "0.6.0";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -954,31 +954,50 @@
   //   * The artwork rect inside the sprite is face.xy - base.xy, size face.wh.
   //
   // <tiles>
-  const TILES_ENABLED = (() => {
+  const TILE_BASE_SCALE = 0.42; // font size relative to the smaller side of the face
+  // null / "" / junk -> default.  (Number(null) is 0, which must not count.)
+  const clampNum = (v, lo, hi, dflt) => {
+    const n = v === null || v === undefined || v === "" ? NaN : Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+  };
+
+  // Live settings.  New sprites use whatever is set when they are decoded;
+  // sprites already on screen keep their old label until the page is reloaded.
+  const tileCfg = (() => {
+    const cfg = { enabled: true, pos: "tl", scale: 1, dx: 0, dy: 0 };
     try {
-      return localStorage.getItem("tenhou4enTiles") !== "0";
+      cfg.enabled = localStorage.getItem("tenhou4enTiles") !== "0";
+      cfg.pos = localStorage.getItem("tenhou4enTilePos") === "c" ? "c" : "tl";
+      cfg.scale = clampNum(localStorage.getItem("tenhou4enTileScale"), 0.5, 2, 1);
+      const off = (localStorage.getItem("tenhou4enTileOff") || "0,0").split(",");
+      cfg.dx = clampNum(off[0], -0.5, 0.5, 0);
+      cfg.dy = clampNum(off[1], -0.5, 0.5, 0);
     } catch (e) {
-      return true;
+      /* storage unavailable: defaults */
     }
+    return cfg;
   })();
-  // "tl" = top-left corner of the tile face (default), "c" = centred.
-  const TILE_POS = (() => {
+
+  function saveTileCfg() {
     try {
-      return localStorage.getItem("tenhou4enTilePos") === "c" ? "c" : "tl";
+      localStorage.setItem("tenhou4enTiles", tileCfg.enabled ? "1" : "0");
+      localStorage.setItem("tenhou4enTilePos", tileCfg.pos);
+      localStorage.setItem("tenhou4enTileScale", String(tileCfg.scale));
+      localStorage.setItem("tenhou4enTileOff", tileCfg.dx + "," + tileCfg.dy);
     } catch (e) {
-      return "tl";
+      /* ignore */
     }
-  })();
-  const TILE_SCALE = 0.42; // font size relative to the smaller side of the face
-  // Nudge as fractions of the face rect, e.g. "0.05,0" moves 5% right.
-  const TILE_OFF = (() => {
-    try {
-      const v = (localStorage.getItem("tenhou4enTileOff") || "0,0").split(",").map(Number);
-      return [v[0] || 0, v[1] || 0];
-    } catch (e) {
-      return [0, 0];
-    }
-  })();
+  }
+
+  function setTileCfg(patch) {
+    if ("enabled" in patch) tileCfg.enabled = !!patch.enabled;
+    if ("pos" in patch) tileCfg.pos = patch.pos === "c" ? "c" : "tl";
+    if ("scale" in patch) tileCfg.scale = clampNum(patch.scale, 0.5, 2, 1);
+    if ("dx" in patch) tileCfg.dx = clampNum(patch.dx, -0.5, 0.5, 0);
+    if ("dy" in patch) tileCfg.dy = clampNum(patch.dy, -0.5, 0.5, 0);
+    saveTileCfg();
+    return Object.assign({}, tileCfg);
+  }
 
   const OBJ_STRUCT = {
     812278383: 103780, // obj0
@@ -1167,7 +1186,7 @@
   function drawTileLabel(ctx, job) {
     const info = tileText(job.face);
     const r = job.rect;
-    const fs = Math.max(8, Math.round(Math.min(r.w, r.h) * TILE_SCALE));
+    const fs = Math.max(8, Math.round(Math.min(r.w, r.h) * TILE_BASE_SCALE * tileCfg.scale));
     ctx.save();
     ctx.font = "bold " + fs + "px sans-serif";
     ctx.textAlign = "left";
@@ -1176,8 +1195,8 @@
     const padY = Math.round(fs * 0.12);
     const w = Math.ceil(ctx.measureText(info.text).width + padX * 2);
     const h = Math.ceil(fs + padY * 2);
-    let x = (TILE_POS === "c" ? r.x + (r.w - w) / 2 : r.x) + TILE_OFF[0] * r.w;
-    let y = (TILE_POS === "c" ? r.y + (r.h - h) / 2 : r.y) + TILE_OFF[1] * r.h;
+    let x = (tileCfg.pos === "c" ? r.x + (r.w - w) / 2 : r.x) + tileCfg.dx * r.w;
+    let y = (tileCfg.pos === "c" ? r.y + (r.h - h) / 2 : r.y) + tileCfg.dy * r.h;
     x = Math.max(0, Math.min(job.w - w, x));
     y = Math.max(0, Math.min(job.h - h, y));
     ctx.globalAlpha = 0.9;
@@ -1211,6 +1230,7 @@
   // If Tenhou ships a new client the sprite files may change shape.  Say so
   // once, instead of leaving the user with silently missing labels.
   function tileHealthMessage() {
+    if (!tileCfg.enabled) return "";
     if (!tileStats.zlibWrapped) return "Zlib was not found, so tile labels cannot work.";
     if (!tileStats.putWrapped) return "putImageData could not be hooked.";
     if (tileStats.rawInflates > 20 && tileStats.buffers === 0) {
@@ -1223,7 +1243,6 @@
   }
 
   function installTileHooks() {
-    if (!TILES_ENABLED) return;
     if (String(location.pathname).indexOf("/4/") !== 0) return;
 
     const proto = window.CanvasRenderingContext2D && window.CanvasRenderingContext2D.prototype;
@@ -1235,7 +1254,9 @@
         if (job) {
           pendingJob = null;
           try {
-            if (img && img.width === job.w && img.height === job.h) {
+            if (!tileCfg.enabled) {
+              /* labels switched off: nothing to draw */
+            } else if (img && img.width === job.w && img.height === job.h) {
               drawTileLabel(this, job);
               tileStats.labeled++;
             } else {
@@ -1296,37 +1317,314 @@
   const tilesApi = {
     install: installTileHooks,
     stats() {
-      return Object.assign({ enabled: TILES_ENABLED, pos: TILE_POS }, tileStats);
+      return Object.assign({}, tileCfg, tileStats);
+    },
+    getConfig() {
+      return Object.assign({}, tileCfg);
+    },
+    setConfig: setTileCfg,
+    resetConfig() {
+      return setTileCfg({ enabled: true, pos: "tl", scale: 1, dx: 0, dy: 0 });
     },
     setEnabled(on) {
-      try {
-        localStorage.setItem("tenhou4enTiles", on ? "1" : "0");
-      } catch (e) {
-        /* ignore */
-      }
-      console.log("[tenhou4-en] tile labels " + (on ? "on" : "off") + " - reload the page");
+      setTileCfg({ enabled: on });
+      console.log("[tenhou4-en] tile labels " + (on ? "on" : "off") + " (new tiles; reload to update all)");
     },
     setPosition(pos) {
-      try {
-        localStorage.setItem("tenhou4enTilePos", pos === "c" ? "c" : "tl");
-      } catch (e) {
-        /* ignore */
-      }
-      console.log("[tenhou4-en] tile label position set - reload the page");
+      setTileCfg({ pos });
+      console.log("[tenhou4-en] tile label position set (new tiles; reload to update all)");
     },
     setOffset(dx, dy) {
-      try {
-        localStorage.setItem("tenhou4enTileOff", (Number(dx) || 0) + "," + (Number(dy) || 0));
-      } catch (e) {
-        /* ignore */
-      }
-      console.log("[tenhou4-en] tile label offset set - reload the page");
+      setTileCfg({ dx, dy });
+      console.log("[tenhou4-en] tile label offset set (new tiles; reload to update all)");
     },
-    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText, tileHealthMessage },
+    setScale(scale) {
+      setTileCfg({ scale });
+      console.log("[tenhou4-en] tile label size set (new tiles; reload to update all)");
+    },
+    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText, tileHealthMessage, tileCfg },
   };
   // </tiles>
 
   tilesApi.install();
+
+  // ---------------------------------------------------------- settings panel
+  //
+  // A small gear button (top-left) opens a panel, so nothing needs the console.
+  // Also opens with Alt+T.  It lives in a shadow root, so the page's global CSS
+  // (INPUT, BUTTON, LABEL ... rules) cannot restyle it, and the game's own
+  // mouse/touch/key handlers never see events from inside it - otherwise a
+  // click on the panel could be taken for a click on the tile underneath.
+  //
+  // <settings>
+  const SETTINGS_CSS = `
+    :host { all: initial; }
+    /* Page styles (e.g. "* { line-height: 1 }") reach the host and are inherited,
+       so everything inherited is reset here, on the wrapper. */
+    .ui { all: initial; display: block; font: 13px/1.35 system-ui, "Segoe UI", Roboto, sans-serif;
+      color: #e8e8ee; text-align: left; }
+    *, *::before, *::after { box-sizing: border-box; }
+    .fab { width: 34px; height: 34px; padding: 0; border-radius: 50%; border: 1px solid #666;
+      background: rgba(10,10,14,.6); color: #fff; font-size: 17px; line-height: 1; cursor: pointer; opacity: .5; }
+    .fab:hover, .fab.on { opacity: 1; background: rgba(30,30,40,.92); }
+    .panel { display: none; margin-top: 6px; width: 310px; max-width: calc(100vw - 16px);
+      max-height: calc(100vh - 56px); overflow-y: auto;
+      background: rgba(14,14,20,.97); border: 1px solid #4a4a58; border-radius: 10px;
+      padding: 10px 12px 12px; box-shadow: 0 8px 28px rgba(0,0,0,.6); }
+    .panel.open { display: block; }
+    h1 { margin: 0 0 4px; font-size: 14px; font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
+    h1 small { font-weight: 400; color: #9a9aa8; margin-left: 6px; }
+    h2 { margin: 12px 0 6px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #9a9aa8; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+    .row > label { flex: 0 0 82px; color: #cfcfd8; }
+    .row > .ctl { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+    input[type=range] { flex: 1; min-width: 0; accent-color: #4aa3ff; }
+    .val { flex: 0 0 42px; text-align: right; color: #9a9aa8; font-variant-numeric: tabular-nums; }
+    select { background: #22222c; color: #eee; border: 1px solid #555; border-radius: 5px; padding: 3px 6px; font: inherit; }
+    input[type=checkbox] { width: 16px; height: 16px; accent-color: #4aa3ff; }
+    .off .row.dep { opacity: .4; pointer-events: none; }
+    .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 8px 0 2px; color: #9a9aa8; font-size: 11.5px; }
+    .chip { display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 700; font-size: 12px; }
+    .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    button.b { flex: 1 1 auto; background: #2a2a36; color: #eee; border: 1px solid #55556a; border-radius: 6px; padding: 6px 8px; cursor: pointer; font: inherit; }
+    button.b:hover { background: #38384a; }
+    button.x { background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; padding: 0 4px; line-height: 1; }
+    button.x:hover { color: #fff; }
+    .status { margin-top: 10px; padding: 6px 8px; border-radius: 6px; background: #1c2a1f; color: #b9e0bd; font-size: 12px; word-break: break-word; }
+    .status.warn { color: #ffd479; background: #3a2e12; }
+    .hint { margin-top: 8px; color: #8a8a98; font-size: 11.5px; }
+    textarea { display: none; width: 100%; height: 90px; margin-top: 8px; background: #101018; color: #ddd;
+      border: 1px solid #444; border-radius: 6px; font: 11px/1.3 ui-monospace, Consolas, monospace; }
+  `;
+
+  const SETTINGS_HTML = `
+    <div class="ui"><button class="fab" title="Tenhou English settings (Alt+T)">&#9881;</button>
+    <div class="panel" id="panel">
+      <h1><span>Tenhou English<small id="ver"></small></span><button class="x" data-act="close" title="Close">&times;</button></h1>
+      <h2>Tile labels</h2>
+      <div class="row"><label for="en">Show labels</label><div class="ctl"><input id="en" type="checkbox"></div></div>
+      <div class="row dep"><label for="pos">Position</label><div class="ctl">
+        <select id="pos"><option value="tl">Top-left corner</option><option value="c">Centre of tile</option></select></div></div>
+      <div class="row dep"><label for="sc">Size</label><div class="ctl">
+        <input id="sc" type="range" min="50" max="200" step="5"><span class="val" id="scv"></span></div></div>
+      <div class="row dep"><label for="dx">Left / right</label><div class="ctl">
+        <input id="dx" type="range" min="-30" max="30" step="1"><span class="val" id="dxv"></span></div></div>
+      <div class="row dep"><label for="dy">Up / down</label><div class="ctl">
+        <input id="dy" type="range" min="-30" max="30" step="1"><span class="val" id="dyv"></span></div></div>
+      <div class="legend" id="legend"></div>
+      <div class="status" id="status"></div>
+      <div class="hint">New tiles use these settings straight away. Press <b>Reload page</b> to update every tile on screen (best between games).</div>
+      <div class="btns">
+        <button class="b" data-act="reset">Reset</button>
+        <button class="b" data-act="reload">Reload page</button>
+        <button class="b" data-act="report">Copy bug report</button>
+      </div>
+      <textarea id="rep" readonly></textarea>
+    </div></div>`;
+
+  // Text for a bug report: versions, settings, counters and the Japanese still
+  // on screen.  Player names and score lines are left out.
+  function buildReport() {
+    const api = window.__tenhou4en;
+    const left = (api && api.scan ? api.scan() : [])
+      .filter((t) => !PLAYER_NAMES.has(t) && !PLAYER_SCORE_LINE_RE.test(t))
+      .slice(0, 60);
+    const warn = tileHealthMessage();
+    return [
+      "Tenhou /4 English v" + VERSION,
+      "Browser: " + navigator.userAgent,
+      "Page: " + location.origin + location.pathname,
+      "Tile settings: " + JSON.stringify(tilesApi.getConfig()),
+      "Tile stats: " + JSON.stringify(tileStats),
+      "Tile warning: " + (warn || "none"),
+      "Untranslated Japanese on screen (" + left.length + "):",
+    ]
+      .concat(left.map((t) => "  " + JSON.stringify(t)))
+      .join("\n");
+  }
+
+  function installSettingsUI() {
+    if (String(location.pathname).indexOf("/4/") !== 0) return null;
+    const ui = { open() { }, close() { }, toggle() { }, buildReport, host: null };
+
+    const mount = () => {
+      if (!document.body || document.getElementById("tenhou4en-settings")) return;
+      const host = document.createElement("div");
+      host.id = "tenhou4en-settings";
+      // inline style: beats any page stylesheet rule
+      host.style.cssText = "all:initial;position:fixed;left:8px;top:8px;z-index:2147483000;display:block";
+      const root = host.attachShadow({ mode: "open" });
+      root.innerHTML = "<style>" + SETTINGS_CSS + "</style>" + SETTINGS_HTML;
+      const $ = (id) => root.getElementById(id);
+      ui.host = host;
+
+      // Keep every pointer / touch / key event inside the panel away from the
+      // game's window-level handlers.
+      for (const ev of [
+        "mousedown", "mouseup", "mousemove", "click", "dblclick", "contextmenu",
+        "pointerdown", "pointerup", "pointermove", "touchstart", "touchend", "touchmove",
+        "keydown", "keyup", "wheel",
+      ]) {
+        host.addEventListener(ev, (e) => e.stopPropagation());
+      }
+      // The game also listens for wheel in the capture phase on document.
+      window.addEventListener(
+        "wheel",
+        (e) => {
+          if (e.composedPath && e.composedPath().indexOf(host) >= 0) e.stopImmediatePropagation();
+        },
+        true
+      );
+
+      $("ver").textContent = "v" + VERSION;
+      const legend = $("legend");
+      legend.appendChild(document.createTextNode("Colours:"));
+      for (const f of [1, 11, 21, 30, 34, 0]) {
+        const t = tileText(f);
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.textContent = t.text;
+        chip.style.background = t.bg;
+        chip.style.color = t.fg;
+        legend.appendChild(chip);
+      }
+      legend.appendChild(document.createTextNode("(gold = red five)"));
+
+      let timer = null;
+      let flashUntil = 0;
+      const panel = $("panel");
+      const fab = root.querySelector(".fab");
+
+      const refresh = () => {
+        const c = tilesApi.getConfig();
+        $("en").checked = c.enabled;
+        $("pos").value = c.pos;
+        $("sc").value = Math.round(c.scale * 100);
+        $("dx").value = Math.round(c.dx * 100);
+        $("dy").value = Math.round(c.dy * 100);
+        $("scv").textContent = Math.round(c.scale * 100) + "%";
+        $("dxv").textContent = Math.round(c.dx * 100) + "%";
+        $("dyv").textContent = Math.round(c.dy * 100) + "%";
+        panel.classList.toggle("off", !c.enabled);
+
+        if (Date.now() < flashUntil) return;
+        const st = $("status");
+        const warn = tileHealthMessage();
+        if (!c.enabled) {
+          st.className = "status";
+          st.textContent = "Tile labels are off.";
+        } else if (warn) {
+          st.className = "status warn";
+          st.textContent = "Tile labels are not working: " + warn;
+        } else if (tileStats.labeled > 0) {
+          st.className = "status";
+          st.textContent = "Tile labels are working (" + tileStats.labeled + " tile images labelled).";
+        } else {
+          st.className = "status";
+          st.textContent = "Waiting for a game to start...";
+        }
+      };
+
+      const flash = (text, warn) => {
+        const st = $("status");
+        st.className = "status" + (warn ? " warn" : "");
+        st.textContent = text;
+        flashUntil = Date.now() + 3500;
+        setTimeout(refresh, 3600);
+      };
+
+      const setOpen = (want) => {
+        panel.classList.toggle("open", want);
+        fab.classList.toggle("on", want);
+        clearInterval(timer);
+        if (want) {
+          refresh();
+          timer = setInterval(refresh, 1000);
+        }
+      };
+      ui.open = () => setOpen(true);
+      ui.close = () => setOpen(false);
+      ui.toggle = () => setOpen(!panel.classList.contains("open"));
+
+      const copyText = async (text) => {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (e) {
+          /* fall through to the manual route */
+        }
+        try {
+          const ta = $("rep");
+          ta.style.display = "block";
+          ta.value = text;
+          ta.focus();
+          ta.select();
+          return document.execCommand("copy");
+        } catch (e) {
+          return false;
+        }
+      };
+
+      fab.addEventListener("click", ui.toggle);
+      $("en").addEventListener("change", () => {
+        tilesApi.setConfig({ enabled: $("en").checked });
+        refresh();
+      });
+      $("pos").addEventListener("change", () => {
+        tilesApi.setConfig({ pos: $("pos").value });
+        refresh();
+      });
+      for (const [id, key] of [["sc", "scale"], ["dx", "dx"], ["dy", "dy"]]) {
+        $(id).addEventListener("input", () => {
+          tilesApi.setConfig({ [key]: Number($(id).value) / 100 });
+          refresh();
+        });
+      }
+      root.addEventListener("click", async (e) => {
+        const btn = e.target.closest && e.target.closest("[data-act]");
+        if (!btn) return;
+        const act = btn.getAttribute("data-act");
+        if (act === "close") ui.close();
+        else if (act === "reset") {
+          tilesApi.resetConfig();
+          refresh();
+          flash("Settings reset.");
+        } else if (act === "reload") location.reload();
+        else if (act === "report") {
+          const ok = await copyText(buildReport());
+          flash(
+            ok ? "Copied. Paste it into your bug report." : "Could not copy - select the text below and copy it.",
+            !ok
+          );
+        }
+      });
+      root.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") ui.close();
+      });
+
+      refresh();
+      document.body.appendChild(host);
+    };
+
+    // Capture phase: must run even when focus is still inside the panel, whose
+    // host swallows key events before they bubble to the window.
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "t" || e.key === "T")) {
+          e.preventDefault();
+          ui.toggle();
+        }
+      },
+      true
+    );
+
+    if (document.body) mount();
+    else document.addEventListener("DOMContentLoaded", mount, { once: true });
+    return ui;
+  }
+  // </settings>
+  const settingsUi = installSettingsUI();
 
   // --------------------------------------------------------------- debugging
 
@@ -1334,6 +1632,7 @@
     version: VERSION,
     playerNames: () => [...PLAYER_NAMES],
     tiles: tilesApi,
+    settings: settingsUi,
     yaku: YAKU,
     ranks: RANKS,
     misc: MISC,
