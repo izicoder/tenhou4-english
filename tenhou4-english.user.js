@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
-// @namespace    https://github.com/local/tenhou4-english
+// @namespace    https://github.com/izicoder/tenhou4-english
 // @version      0.6.0
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
-// @author       you
+// @author       izicoder
+// @homepageURL  https://github.com/izicoder/tenhou4-english
+// @supportURL   https://github.com/izicoder/tenhou4-english/issues
+// @downloadURL  https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
+// @updateURL    https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
 // @match        https://tenhou.net/man/*
