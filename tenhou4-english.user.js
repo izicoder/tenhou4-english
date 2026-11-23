@@ -1,20 +1,12 @@
 // ==UserScript==
 // @name         Tenhou /4 English (full)
 // @name:ja      天鳳 /4 英語化
-// @namespace    https://github.com/izicoder/tenhou4-english
-// @version      0.6.0
+// @namespace    https://github.com/local/tenhou4-english
+// @version      0.7.0
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
-// @author       izicoder
-// @homepageURL  https://github.com/izicoder/tenhou4-english
-// @supportURL   https://github.com/izicoder/tenhou4-english/issues
-// @downloadURL  https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
-// @updateURL    https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
+// @author       you
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
-// @match        https://tenhou.net/man/*
-// @match        https://tenhou.net/man/
-// @match        https://tenhou.net/reg/*
-// @match        https://tenhou.net/reg/
 // @run-at       document-start
 // @grant        none
 // @noframes
@@ -52,7 +44,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.0";
+  const VERSION = "0.7.0";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -62,23 +54,175 @@
   }
   window.__tenhou4enInstalled = true;
 
-  const DEBUG =
-    /[?&]tenhou_en_debug=1\b/.test(location.search) ||
-    (() => {
-      try {
-        return localStorage.getItem("tenhou4enDebug") === "1";
-      } catch (e) {
-        return false;
+  // ---------------------------------------------------------------- settings
+  //
+  // Every user-facing option lives here, is validated on the way in and out,
+  // and is saved as one JSON object.  The settings panel is just a view of it.
+  //
+  // <store>
+  const SETTINGS_KEY = "tenhou4enSettings";
+
+  // null / "" / junk -> default.  (Number(null) is 0, which must not count.)
+  const clampNum = (v, lo, hi, dflt) => {
+    const n = v === null || v === undefined || v === "" ? NaN : Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+  };
+
+  const SETTING_DEFS = {
+    // --- tile labels
+    enabled: { def: true },
+    showHand: { def: true },
+    showDiscards: { def: true },
+    showMelds: { def: true },
+    showWall: { def: true },
+    showOthers: { def: true },
+    pos: { def: "tl", oneOf: ["tl", "c"] },
+    scale: { def: 1, min: 0.5, max: 2 },
+    dx: { def: 0, min: -0.5, max: 0.5 },
+    dy: { def: 0, min: -0.5, max: 0.5 },
+    opacity: { def: 0.9, min: 0.3, max: 1 },
+    text: { def: "full", oneOf: ["full", "number"] },
+    honors: { def: "wh", oneOf: ["wh", "pfc"] },
+    red: { def: "five", oneOf: ["five", "zero"] },
+    palette: { def: "default", oneOf: ["default", "contrast", "cb"] },
+    // --- translation
+    translate: { def: true },
+    fillTable: { def: true },
+    forceEn: { def: true },
+    debug: { def: false },
+    custom: { def: "", maxLen: 20000 },
+    // --- panel
+    buttonPos: { def: "tl", oneOf: ["tl", "tr", "bl", "br"] },
+    buttonHidden: { def: false },
+    hotkey: { def: "t", pattern: /^[a-z0-9]$/i },
+  };
+  const TILE_KEYS = [
+    "enabled", "showHand", "showDiscards", "showMelds", "showWall", "showOthers",
+    "pos", "scale", "dx", "dy", "opacity", "text", "honors", "red", "palette",
+  ];
+
+  function coerceSetting(key, v) {
+    const d = SETTING_DEFS[key];
+    if (!d) return undefined;
+    if (typeof d.def === "boolean") {
+      if (typeof v === "boolean") return v;
+      if (v === "1" || v === "true") return true;
+      if (v === "0" || v === "false") return false;
+      return d.def;
+    }
+    if (typeof d.def === "number") return clampNum(v, d.min, d.max, d.def);
+    if (d.oneOf) return d.oneOf.indexOf(v) >= 0 ? v : d.def;
+    if (typeof v !== "string") return d.def;
+    if (d.pattern) return d.pattern.test(v) ? v.toLowerCase() : d.def;
+    return v.slice(0, d.maxLen || 200);
+  }
+
+  function loadSettings() {
+    const s = {};
+    for (const k in SETTING_DEFS) s[k] = SETTING_DEFS[k].def;
+    try {
+      const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+      if (stored && typeof stored === "object") {
+        for (const k in SETTING_DEFS) if (k in stored) s[k] = coerceSetting(k, stored[k]);
+        return s;
       }
-    })();
+    } catch (e) {
+      /* fall through to the legacy keys */
+    }
+    // v0.5.x / v0.6.0 kept a few options under separate keys.
+    try {
+      const g = (k) => localStorage.getItem(k);
+      if (g("tenhou4enTiles") !== null) s.enabled = g("tenhou4enTiles") !== "0";
+      if (g("tenhou4enTilePos") !== null) s.pos = coerceSetting("pos", g("tenhou4enTilePos"));
+      if (g("tenhou4enTileScale") !== null) s.scale = coerceSetting("scale", g("tenhou4enTileScale"));
+      const off = String(g("tenhou4enTileOff") || "").split(",");
+      if (off.length === 2) {
+        s.dx = coerceSetting("dx", off[0]);
+        s.dy = coerceSetting("dy", off[1]);
+      }
+      if (g("tenhou4enDebug") === "1") s.debug = true;
+    } catch (e) {
+      /* storage unavailable: defaults */
+    }
+    return s;
+  }
+
+  const settings = loadSettings();
+  const settingListeners = [];
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (e) {
+      /* private mode etc. */
+    }
+  }
+
+  // Apply a patch; unknown keys are ignored, bad values fall back to defaults.
+  function setSettings(patch) {
+    const changed = [];
+    for (const k in patch) {
+      if (!(k in SETTING_DEFS)) continue;
+      const v = coerceSetting(k, patch[k]);
+      if (v !== settings[k]) {
+        settings[k] = v;
+        changed.push(k);
+      }
+    }
+    if (changed.length) {
+      saveSettings();
+      for (const fn of settingListeners.slice()) {
+        try {
+          fn(changed);
+        } catch (e) {
+          /* a broken listener must not block the others */
+        }
+      }
+    }
+    return Object.assign({}, settings);
+  }
+
+  function resetSettings(keys) {
+    const patch = {};
+    for (const k of keys || Object.keys(SETTING_DEFS)) if (k in SETTING_DEFS) patch[k] = SETTING_DEFS[k].def;
+    return setSettings(patch);
+  }
+
+  function exportSettings() {
+    return JSON.stringify(Object.assign({ tenhou4en: "settings" }, settings), null, 2);
+  }
+
+  function importSettings(text) {
+    let obj;
+    try {
+      obj = JSON.parse(String(text));
+    } catch (e) {
+      return { ok: false, error: "That is not valid JSON." };
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      return { ok: false, error: "That is not a settings object." };
+    }
+    const known = Object.keys(obj).filter((k) => k in SETTING_DEFS);
+    if (!known.length) return { ok: false, error: "No known settings found." };
+    const patch = {};
+    for (const k of known) patch[k] = obj[k];
+    setSettings(patch);
+    return { ok: true, count: known.length };
+  }
+  // </store>
+
+  const QUERY_DEBUG = /[?&]tenhou_en_debug=1\b/.test(location.search);
+  const isDebug = () => QUERY_DEBUG || settings.debug;
 
   // ---------------------------------------------------------------- language
 
   // Must happen before latest.js reads it.  "en" and "EN" both resolve to en.
-  try {
-    localStorage.setItem("lang", "en");
-  } catch (e) {
-    /* private mode etc. */
+  if (settings.forceEn) {
+    try {
+      localStorage.setItem("lang", "en");
+    } catch (e) {
+      /* private mode etc. */
+    }
   }
 
   // ------------------------------------------------------- string table patch
@@ -180,6 +324,7 @@
         }
 
         if (this.readyState !== 4) return value;
+        if (!settings.fillTable) return value;
         if (!LANG_URL_RE.test(this.__tenhouUrl || "")) return value;
         if (value == null) return value;
 
@@ -370,32 +515,51 @@
     "天鳳 / Desktop4K版": "Tenhou / Desktop4K",
     // In-game.
     "對局": "Game",
-    // /reg/ paid-membership page.
-    "有料版有効期限の購入": "Purchase Paid Membership",
-    "有料会員にのみ提供されているサービス(Windows版天鳳/鳳凰卓での対戦/有料の大会への参加/有料のトレーニングコンテンツ)を利用するには、 １つのプレーヤIDにつき「25日で550円」または「22日500円」の利用料金をお支払いいただく必要があります。 数か月分まとめてお支払いいただくこともできます。 お支払いには以下の決済サービスがご利用いただけます。":
-      'To use services available only to paid members (Windows Tenhou / Phoenix table matches / paid tournament entry / paid training content), you must pay a usage fee of "550 yen for 25 days" or "500 yen for 22 days" per player ID. You can pay for several months at once. The following payment services are accepted.',
-    "- クレジットカード(VISA/MasterCard/JCB/AmericanExpress/Diners/Discover)":
-      "- Credit card (VISA/MasterCard/JCB/AmericanExpress/Diners/Discover)",
-    "- ドコモケータイ払い": "- Docomo Mobile Payment",
-    "- au かんたん決済／au WALLET": "- au Simple Payment / au WALLET",
-    "- WebMoney(コンビニ他/カード/銀行振り込み)":
-      "- WebMoney (convenience store / card / bank transfer)",
-    "- BitCash(コンビニ他/カード/銀行振り込み)":
-      "- BitCash (convenience store / card / bank transfer)",
-    "- NetCash(コンビニ他/カード/銀行振り込み)":
-      "- NetCash (convenience store / card / bank transfer)",
-    "プレーヤIDの３文字目から'-'までの８文字を正確に入力してください。":
-      "Enter the 8 characters from the 3rd character of your Player ID up to the '-'.",
-    "-abcdefgh」の「00112233」に対応する部分":
-      'the "00112233" part of "ID00112233-abcdefgh"',
-    "※アルファベットの部分は大文字で入力してください":
-      "* Enter the alphabetical part in uppercase.",
-    "お問い合わせ": "Contact",
-    "特定商取引に関する法律に基づく表記":
-      "Notation under the Act on Specified Commercial Transactions",
   };
 
   const EXACT = Object.assign({}, MISC, RANKS, YAKU);
+
+  // ------------------------------------------------- user's own translations
+  // One per line:  日本語 = English   ("#" or "//" start a comment).
+  // <custom>
+  function parseCustom(text) {
+    const entries = new Map();
+    const errors = [];
+    const lines = String(text || "").split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line || line[0] === "#" || line.slice(0, 2) === "//") continue;
+      const eq = line.indexOf("=");
+      if (eq <= 0) {
+        errors.push("line " + (i + 1) + ": no \"=\" found");
+        continue;
+      }
+      const ja = line.slice(0, eq).trim();
+      const en = line.slice(eq + 1).trim();
+      if (!ja || !en) errors.push("line " + (i + 1) + ": needs text on both sides of \"=\"");
+      else if (ja.length > 200 || en.length > 400) errors.push("line " + (i + 1) + ": too long");
+      else if (entries.size >= 300) errors.push("line " + (i + 1) + ": limit of 300 entries reached");
+      else entries.set(ja, en);
+    }
+    return { entries, errors };
+  }
+
+  const customPrev = new Map(); // Japanese -> value it replaced (undefined = none)
+  function applyCustom(text) {
+    for (const [ja, prev] of customPrev) {
+      if (prev === undefined) delete EXACT[ja];
+      else EXACT[ja] = prev;
+    }
+    customPrev.clear();
+    const res = parseCustom(text);
+    for (const [ja, en] of res.entries) {
+      customPrev.set(ja, EXACT[ja]);
+      EXACT[ja] = en;
+    }
+    return res;
+  }
+  // </custom>
+  applyCustom(settings.custom);
 
   const WIND = { 東: "East", 南: "South", 西: "West", 北: "North" };
 
@@ -429,9 +593,37 @@
     return ORIGINALS.has(node) ? ORIGINALS.get(node) : node.nodeValue;
   }
 
+  // What we last wrote into each node.  If the client later writes something
+  // else, that is a new original (so restoring never brings back stale text).
+  const WRITTEN = new WeakMap();
+
   function setNodeValue(node, value) {
-    if (!ORIGINALS.has(node)) ORIGINALS.set(node, node.nodeValue);
-    if (node.nodeValue !== value) node.nodeValue = value;
+    const cur = node.nodeValue;
+    if (!ORIGINALS.has(node) || (WRITTEN.has(node) && WRITTEN.get(node) !== cur)) {
+      ORIGINALS.set(node, cur);
+    }
+    WRITTEN.set(node, value);
+    if (cur !== value) node.nodeValue = value;
+  }
+
+  // Put the Japanese back everywhere we replaced it.
+  function restoreOriginals() {
+    const root = document.documentElement;
+    if (!root) return 0;
+    const walker = document.createTreeWalker(root, 4, null);
+    let n;
+    let count = 0;
+    while ((n = walker.nextNode())) {
+      if (!ORIGINALS.has(n)) continue;
+      const o = ORIGINALS.get(n);
+      if (n.nodeValue !== o) {
+        n.nodeValue = o;
+        count++;
+      }
+      ORIGINALS.delete(n);
+      WRITTEN.delete(n);
+    }
+    return count;
   }
 
   function childTextNodes(parent) {
@@ -756,7 +948,7 @@
       const out = TAB_LABELS[text];
       if (out == null) return false;
       const i = raw.indexOf(text);
-      node.nodeValue = raw.slice(0, i) + out + raw.slice(i + text.length);
+      setNodeValue(node, raw.slice(0, i) + out + raw.slice(i + text.length));
       return true;
     }
     return false;
@@ -828,6 +1020,7 @@
   const PLAYER_SCORE_LINE_RE = /^[A-D]:.*\([+-]?\d+(?:\.\d)?\)$/;
 
   function translateTextNode(node) {
+    if (!settings.translate) return;
     const raw = node.nodeValue;
     if (!raw) return;
 
@@ -870,12 +1063,12 @@
     const text = raw.trim();
     if (!text) return;
 
-    // Static-page paragraphs can contain newlines/tabs; match them normalized
-    // and replace the whole node.
+    // Text with newlines/tabs or runs of spaces: match it normalized and
+    // replace the whole node.
     const normalized = text.replace(/\s+/g, " ");
     const normalizedHit = EXACT[normalized];
     if (normalizedHit != null && normalizedHit !== normalized) {
-      node.nodeValue = normalizedHit;
+      setNodeValue(node, normalizedHit);
       return;
     }
 
@@ -883,14 +1076,14 @@
     if (out != null) {
       if (out === text) return;
       const i = raw.indexOf(text);
-      node.nodeValue = raw.slice(0, i) + out + raw.slice(i + text.length);
+      setNodeValue(node, raw.slice(0, i) + out + raw.slice(i + text.length));
       return;
     }
 
     // "D:name(-21.0)" lines of the final score table carry player names.
     if (PLAYER_SCORE_LINE_RE.test(text)) return;
 
-    if (DEBUG && /[\u3040-\u30ff\u4e00-\u9fff]/.test(text) && !seenUnknown.has(text)) {
+    if (isDebug() && /[\u3040-\u30ff\u4e00-\u9fff]/.test(text) && !seenUnknown.has(text)) {
       seenUnknown.add(text);
       console.log("[tenhou4-en] untranslated:", JSON.stringify(text));
     }
@@ -939,6 +1132,14 @@
   if (document.documentElement) start();
   else document.addEventListener("DOMContentLoaded", start, { once: true });
 
+  settingListeners.push((keys) => {
+    if (keys.indexOf("custom") >= 0) applyCustom(settings.custom);
+    if (keys.indexOf("custom") >= 0 || keys.indexOf("translate") >= 0) {
+      restoreOriginals();
+      if (settings.translate) walk(document.documentElement);
+    }
+  });
+
   // ------------------------------------------------------------- tile labels
   //
   // How it works (derived from latest.js):
@@ -959,49 +1160,10 @@
   //
   // <tiles>
   const TILE_BASE_SCALE = 0.42; // font size relative to the smaller side of the face
-  // null / "" / junk -> default.  (Number(null) is 0, which must not count.)
-  const clampNum = (v, lo, hi, dflt) => {
-    const n = v === null || v === undefined || v === "" ? NaN : Number(v);
-    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
-  };
-
-  // Live settings.  New sprites use whatever is set when they are decoded;
-  // sprites already on screen keep their old label until the page is reloaded.
-  const tileCfg = (() => {
-    const cfg = { enabled: true, pos: "tl", scale: 1, dx: 0, dy: 0 };
-    try {
-      cfg.enabled = localStorage.getItem("tenhou4enTiles") !== "0";
-      cfg.pos = localStorage.getItem("tenhou4enTilePos") === "c" ? "c" : "tl";
-      cfg.scale = clampNum(localStorage.getItem("tenhou4enTileScale"), 0.5, 2, 1);
-      const off = (localStorage.getItem("tenhou4enTileOff") || "0,0").split(",");
-      cfg.dx = clampNum(off[0], -0.5, 0.5, 0);
-      cfg.dy = clampNum(off[1], -0.5, 0.5, 0);
-    } catch (e) {
-      /* storage unavailable: defaults */
-    }
-    return cfg;
-  })();
-
-  function saveTileCfg() {
-    try {
-      localStorage.setItem("tenhou4enTiles", tileCfg.enabled ? "1" : "0");
-      localStorage.setItem("tenhou4enTilePos", tileCfg.pos);
-      localStorage.setItem("tenhou4enTileScale", String(tileCfg.scale));
-      localStorage.setItem("tenhou4enTileOff", tileCfg.dx + "," + tileCfg.dy);
-    } catch (e) {
-      /* ignore */
-    }
-  }
-
-  function setTileCfg(patch) {
-    if ("enabled" in patch) tileCfg.enabled = !!patch.enabled;
-    if ("pos" in patch) tileCfg.pos = patch.pos === "c" ? "c" : "tl";
-    if ("scale" in patch) tileCfg.scale = clampNum(patch.scale, 0.5, 2, 1);
-    if ("dx" in patch) tileCfg.dx = clampNum(patch.dx, -0.5, 0.5, 0);
-    if ("dy" in patch) tileCfg.dy = clampNum(patch.dy, -0.5, 0.5, 0);
-    saveTileCfg();
-    return Object.assign({}, tileCfg);
-  }
+  // Settings (enabled, pos, scale, dx, dy, opacity, text, honors, red, palette
+  // and the "which tiles" switches) come from the shared store above.  New
+  // sprites use whatever is set when they are decoded; sprites already on
+  // screen keep their old label until the page is reloaded.
 
   const OBJ_STRUCT = {
     812278383: 103780, // obj0
@@ -1172,25 +1334,47 @@
     }
   }
 
+  const PALETTES = {
+    default: { m: "#b03a2e", p: "#1f618d", s: "#1e8449", z: "#6c3483", aka: "#c9a000", akaFg: "#000", fg: "#fff", outline: false },
+    contrast: { m: "#e00000", p: "#0050e6", s: "#008a2e", z: "#8000c8", aka: "#ffd400", akaFg: "#000", fg: "#fff", outline: true },
+    // Okabe-Ito colours: distinguishable with the common colour-blindness types.
+    cb: { m: "#d55e00", p: "#0072b2", s: "#009e73", z: "#cc79a7", aka: "#f0e442", akaFg: "#000", fg: "#fff", outline: false },
+  };
+
   function tileText(face) {
+    const pal = PALETTES[settings.palette] || PALETTES.default;
     if (face >= 30 && face <= 36) {
-      return {
-        text: ["E", "S", "W", "N", "Wh", "Gr", "Rd"][face - 30],
-        bg: "#6c3483",
-        fg: "#fff",
-      };
+      const names = settings.honors === "pfc" ? ["E", "S", "W", "N", "P", "F", "C"] : ["E", "S", "W", "N", "Wh", "Gr", "Rd"];
+      return { text: names[face - 30], bg: pal.z, fg: pal.fg, outline: pal.outline };
     }
     const suit = face < 10 ? "m" : face < 20 ? "p" : "s";
     const n = face % 10;
-    const bg = { m: "#b03a2e", p: "#1f618d", s: "#1e8449" }[suit];
-    if (n === 0) return { text: "5" + suit, bg: "#c9a000", fg: "#000" }; // red five
-    return { text: n + suit, bg, fg: "#fff" };
+    const tail = settings.text === "number" ? "" : suit;
+    if (n === 0) return { text: (settings.red === "zero" ? "0" : "5") + tail, bg: pal.aka, fg: pal.akaFg, outline: false };
+    return { text: n + tail, bg: pal[suit], fg: pal.fg, outline: pal.outline };
+  }
+
+  // The "which tiles" switches.  Sheets: 116 hand, 107 discards, 110 melds /
+  // dora / result-screen tiles, 121 wall.
+  function tileScopeAllowed(job) {
+    switch (job.sheet) {
+      case 116:
+        return job.seat === 0 ? settings.showHand : settings.showOthers;
+      case 107:
+        return settings.showDiscards;
+      case 110:
+        return settings.showMelds;
+      case 121:
+        return settings.showWall;
+      default:
+        return true;
+    }
   }
 
   function drawTileLabel(ctx, job) {
     const info = tileText(job.face);
     const r = job.rect;
-    const fs = Math.max(8, Math.round(Math.min(r.w, r.h) * TILE_BASE_SCALE * tileCfg.scale));
+    const fs = Math.max(8, Math.round(Math.min(r.w, r.h) * TILE_BASE_SCALE * settings.scale));
     ctx.save();
     ctx.font = "bold " + fs + "px sans-serif";
     ctx.textAlign = "left";
@@ -1199,14 +1383,20 @@
     const padY = Math.round(fs * 0.12);
     const w = Math.ceil(ctx.measureText(info.text).width + padX * 2);
     const h = Math.ceil(fs + padY * 2);
-    let x = (tileCfg.pos === "c" ? r.x + (r.w - w) / 2 : r.x) + tileCfg.dx * r.w;
-    let y = (tileCfg.pos === "c" ? r.y + (r.h - h) / 2 : r.y) + tileCfg.dy * r.h;
+    let x = (settings.pos === "c" ? r.x + (r.w - w) / 2 : r.x) + settings.dx * r.w;
+    let y = (settings.pos === "c" ? r.y + (r.h - h) / 2 : r.y) + settings.dy * r.h;
     x = Math.max(0, Math.min(job.w - w, x));
     y = Math.max(0, Math.min(job.h - h, y));
-    ctx.globalAlpha = 0.9;
+    ctx.globalAlpha = settings.opacity;
     ctx.fillStyle = info.bg;
     ctx.fillRect(x, y, w, h);
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = Math.min(1, settings.opacity + 0.1);
+    if (info.outline) {
+      ctx.lineWidth = Math.max(2, fs * 0.16);
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "#000";
+      ctx.strokeText(info.text, x + padX, y + h / 2 + 0.5);
+    }
     ctx.fillStyle = info.fg;
     ctx.fillText(info.text, x + padX, y + h / 2 + 0.5);
     ctx.restore();
@@ -1234,7 +1424,7 @@
   // If Tenhou ships a new client the sprite files may change shape.  Say so
   // once, instead of leaving the user with silently missing labels.
   function tileHealthMessage() {
-    if (!tileCfg.enabled) return "";
+    if (!settings.enabled) return "";
     if (!tileStats.zlibWrapped) return "Zlib was not found, so tile labels cannot work.";
     if (!tileStats.putWrapped) return "putImageData could not be hooked.";
     if (tileStats.rawInflates > 20 && tileStats.buffers === 0) {
@@ -1258,8 +1448,8 @@
         if (job) {
           pendingJob = null;
           try {
-            if (!tileCfg.enabled) {
-              /* labels switched off: nothing to draw */
+            if (!settings.enabled || !tileScopeAllowed(job)) {
+              /* labels off, or not wanted on this kind of tile */
             } else if (img && img.width === job.w && img.height === job.h) {
               drawTileLabel(this, job);
               tileStats.labeled++;
@@ -1321,32 +1511,34 @@
   const tilesApi = {
     install: installTileHooks,
     stats() {
-      return Object.assign({}, tileCfg, tileStats);
+      const tile = {};
+      for (const k of TILE_KEYS) tile[k] = settings[k];
+      return Object.assign(tile, tileStats);
     },
     getConfig() {
-      return Object.assign({}, tileCfg);
+      return Object.assign({}, settings);
     },
-    setConfig: setTileCfg,
+    setConfig: setSettings,
     resetConfig() {
-      return setTileCfg({ enabled: true, pos: "tl", scale: 1, dx: 0, dy: 0 });
+      return resetSettings(TILE_KEYS);
     },
     setEnabled(on) {
-      setTileCfg({ enabled: on });
+      setSettings({ enabled: on });
       console.log("[tenhou4-en] tile labels " + (on ? "on" : "off") + " (new tiles; reload to update all)");
     },
     setPosition(pos) {
-      setTileCfg({ pos });
+      setSettings({ pos });
       console.log("[tenhou4-en] tile label position set (new tiles; reload to update all)");
     },
     setOffset(dx, dy) {
-      setTileCfg({ dx, dy });
+      setSettings({ dx, dy });
       console.log("[tenhou4-en] tile label offset set (new tiles; reload to update all)");
     },
     setScale(scale) {
-      setTileCfg({ scale });
+      setSettings({ scale });
       console.log("[tenhou4-en] tile label size set (new tiles; reload to update all)");
     },
-    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText, tileHealthMessage, tileCfg },
+    _test: { normalizeKey, parseObjBuffer, onInflate, wrapZlib, makeJob, tileText, tileHealthMessage, tileScopeAllowed },
   };
   // </tiles>
 
@@ -1354,91 +1546,196 @@
 
   // ---------------------------------------------------------- settings panel
   //
-  // A small gear button (top-left) opens a panel, so nothing needs the console.
-  // Also opens with Alt+T.  It lives in a shadow root, so the page's global CSS
-  // (INPUT, BUTTON, LABEL ... rules) cannot restyle it, and the game's own
-  // mouse/touch/key handlers never see events from inside it - otherwise a
-  // click on the panel could be taken for a click on the tile underneath.
+  // A small gear button opens a panel with every option, so nothing needs the
+  // console.  Also opens with Alt+T (the key is a setting).  It lives in a
+  // shadow root, so the page's global CSS (INPUT, BUTTON, LABEL ... rules)
+  // cannot restyle it, and the game's own mouse/touch/key handlers never see
+  // events from inside it - otherwise a click on the panel could be taken for
+  // a click on the tile underneath.
   //
   // <settings>
   const SETTINGS_CSS = `
     :host { all: initial; }
     /* Page styles (e.g. "* { line-height: 1 }") reach the host and are inherited,
        so everything inherited is reset here, on the wrapper. */
-    .ui { all: initial; display: block; font: 13px/1.35 system-ui, "Segoe UI", Roboto, sans-serif;
-      color: #e8e8ee; text-align: left; }
+    .ui { all: initial; display: flex; flex-direction: column; align-items: flex-start;
+      font: 13px/1.35 system-ui, "Segoe UI", Roboto, sans-serif; color: #e8e8ee; text-align: left; }
+    .ui.bottom { flex-direction: column-reverse; }
+    .ui.right { align-items: flex-end; }
     *, *::before, *::after { box-sizing: border-box; }
-    .fab { width: 34px; height: 34px; padding: 0; border-radius: 50%; border: 1px solid #666;
+    .fab { width: 34px; height: 34px; padding: 0; border-radius: 50%; border: 1px solid #666; flex: none;
       background: rgba(10,10,14,.6); color: #fff; font-size: 17px; line-height: 1; cursor: pointer; opacity: .5; }
-    .fab:hover, .fab.on { opacity: 1; background: rgba(30,30,40,.92); }
-    .panel { display: none; margin-top: 6px; width: 310px; max-width: calc(100vw - 16px);
+    .fab:hover, .fab.on, .fab:focus-visible { opacity: 1; background: rgba(30,30,40,.92); }
+    .ui.fade .fab:not(:hover):not(.on):not(:focus-visible) { opacity: 0; }
+    .panel { display: none; margin: 6px 0; width: 340px; max-width: calc(100vw - 16px);
       max-height: calc(100vh - 56px); overflow-y: auto;
       background: rgba(14,14,20,.97); border: 1px solid #4a4a58; border-radius: 10px;
       padding: 10px 12px 12px; box-shadow: 0 8px 28px rgba(0,0,0,.6); }
     .panel.open { display: block; }
-    h1 { margin: 0 0 4px; font-size: 14px; font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
+    h1 { margin: 0 0 8px; font-size: 14px; font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
     h1 small { font-weight: 400; color: #9a9aa8; margin-left: 6px; }
-    h2 { margin: 12px 0 6px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #9a9aa8; }
+    h2 { margin: 12px 0 5px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #9a9aa8; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 8px; border-bottom: 1px solid #3a3a48; }
+    .tab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent; color: #9a9aa8;
+      padding: 6px 4px; cursor: pointer; font: inherit; }
+    .tab:hover { color: #fff; }
+    .tab.on { color: #fff; border-bottom-color: #4aa3ff; font-weight: 600; }
+    .page { display: none; }
+    .page.on { display: block; }
+    .off { opacity: .4; pointer-events: none; }
+    .chk { display: flex; align-items: flex-start; gap: 8px; margin: 5px 0; cursor: pointer; color: #dcdce4; }
+    .chk.big { font-weight: 600; font-size: 14px; }
+    .toprow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    button.b.small { flex: none; padding: 2px 9px; font-size: 12px; }
+    .chk input { margin-top: 2px; }
     .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-    .row > label { flex: 0 0 82px; color: #cfcfd8; }
-    .row > .ctl { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .lab { flex: 0 0 86px; color: #cfcfd8; }
+    .ctl { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
     input[type=range] { flex: 1; min-width: 0; accent-color: #4aa3ff; }
     .val { flex: 0 0 42px; text-align: right; color: #9a9aa8; font-variant-numeric: tabular-nums; }
-    select { background: #22222c; color: #eee; border: 1px solid #555; border-radius: 5px; padding: 3px 6px; font: inherit; }
-    input[type=checkbox] { width: 16px; height: 16px; accent-color: #4aa3ff; }
-    .off .row.dep { opacity: .4; pointer-events: none; }
-    .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 8px 0 2px; color: #9a9aa8; font-size: 11.5px; }
+    select, input[type=text] { background: #22222c; color: #eee; border: 1px solid #555; border-radius: 5px;
+      padding: 3px 6px; font: inherit; min-width: 0; }
+    select { flex: 1; }
+    input[type=text] { width: 42px; text-align: center; }
+    input[type=checkbox] { width: 16px; height: 16px; accent-color: #4aa3ff; flex: none; }
+    .preview { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 10px 0 2px; color: #9a9aa8; font-size: 11.5px; }
     .chip { display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 700; font-size: 12px; }
-    .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
-    button.b { flex: 1 1 auto; background: #2a2a36; color: #eee; border: 1px solid #55556a; border-radius: 6px; padding: 6px 8px; cursor: pointer; font: inherit; }
+    .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    button.b { flex: 1 1 auto; background: #2a2a36; color: #eee; border: 1px solid #55556a; border-radius: 6px;
+      padding: 6px 8px; cursor: pointer; font: inherit; }
     button.b:hover { background: #38384a; }
+    button.b.warn { border-color: #b8860b; color: #ffd479; }
     button.x { background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; padding: 0 4px; line-height: 1; }
     button.x:hover { color: #fff; }
-    .status { margin-top: 10px; padding: 6px 8px; border-radius: 6px; background: #1c2a1f; color: #b9e0bd; font-size: 12px; word-break: break-word; }
+    .status { margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: #1c2a1f; color: #b9e0bd; font-size: 12px; word-break: break-word; }
     .status.warn { color: #ffd479; background: #3a2e12; }
-    .hint { margin-top: 8px; color: #8a8a98; font-size: 11.5px; }
-    textarea { display: none; width: 100%; height: 90px; margin-top: 8px; background: #101018; color: #ddd;
-      border: 1px solid #444; border-radius: 6px; font: 11px/1.3 ui-monospace, Consolas, monospace; }
+    .reload { display: none; position: sticky; bottom: 0; margin-top: 10px; padding: 6px 8px; border-radius: 6px; background: #1c2538; color: #b9d2f5;
+      border: 1px solid #2f4468;
+      font-size: 12px; align-items: center; gap: 8px; justify-content: space-between; }
+    .reload.show { display: flex; }
+    .hint { margin-top: 6px; color: #8a8a98; font-size: 11.5px; }
+    .muted { color: #8a8a98; font-size: 11.5px; }
+    kbd { background: #2a2a36; border: 1px solid #55556a; border-radius: 4px; padding: 0 5px; font: inherit; }
+    textarea { display: block; width: 100%; margin-top: 6px; background: #101018; color: #ddd;
+      border: 1px solid #444; border-radius: 6px; padding: 5px 6px; font: 12px/1.35 ui-monospace, Consolas, monospace; resize: vertical; }
+    textarea[hidden] { display: none; }
   `;
 
   const SETTINGS_HTML = `
-    <div class="ui"><button class="fab" title="Tenhou English settings (Alt+T)">&#9881;</button>
-    <div class="panel" id="panel">
-      <h1><span>Tenhou English<small id="ver"></small></span><button class="x" data-act="close" title="Close">&times;</button></h1>
-      <h2>Tile labels</h2>
-      <div class="row"><label for="en">Show labels</label><div class="ctl"><input id="en" type="checkbox"></div></div>
-      <div class="row dep"><label for="pos">Position</label><div class="ctl">
-        <select id="pos"><option value="tl">Top-left corner</option><option value="c">Centre of tile</option></select></div></div>
-      <div class="row dep"><label for="sc">Size</label><div class="ctl">
-        <input id="sc" type="range" min="50" max="200" step="5"><span class="val" id="scv"></span></div></div>
-      <div class="row dep"><label for="dx">Left / right</label><div class="ctl">
-        <input id="dx" type="range" min="-30" max="30" step="1"><span class="val" id="dxv"></span></div></div>
-      <div class="row dep"><label for="dy">Up / down</label><div class="ctl">
-        <input id="dy" type="range" min="-30" max="30" step="1"><span class="val" id="dyv"></span></div></div>
-      <div class="legend" id="legend"></div>
-      <div class="status" id="status"></div>
-      <div class="hint">New tiles use these settings straight away. Press <b>Reload page</b> to update every tile on screen (best between games).</div>
-      <div class="btns">
-        <button class="b" data-act="reset">Reset</button>
-        <button class="b" data-act="reload">Reload page</button>
-        <button class="b" data-act="report">Copy bug report</button>
+    <div class="ui" id="ui">
+      <button class="fab" title="Tenhou English settings">&#9881;</button>
+      <div class="panel" id="panel">
+        <h1><span>Tenhou English<small id="ver"></small></span><button class="x" data-act="close" title="Close">&times;</button></h1>
+        <div class="tabs">
+          <button class="tab on" data-tab="tiles">Tiles</button>
+          <button class="tab" data-tab="tr">Translation</button>
+          <button class="tab" data-tab="panel">Panel &amp; data</button>
+        </div>
+
+        <div class="page on" data-page="tiles">
+          <div class="toprow">
+            <label class="chk big"><input type="checkbox" data-key="enabled"> Show tile labels</label>
+            <button class="b small" data-act="reset-tiles" title="Put every tile setting back to its default">Reset</button>
+          </div>
+          <div class="status" id="status"></div>
+          <div id="tiledep">
+            <div class="preview" id="preview"></div>
+            <h2>Which tiles</h2>
+            <label class="chk"><input type="checkbox" data-key="showHand"> My hand</label>
+            <label class="chk"><input type="checkbox" data-key="showDiscards"> Discards (all players)</label>
+            <label class="chk"><input type="checkbox" data-key="showMelds"> Melds, dora and result screen</label>
+            <label class="chk"><input type="checkbox" data-key="showWall"> Wall and revealed dora</label>
+            <label class="chk"><input type="checkbox" data-key="showOthers"> Other players' hands (when shown)</label>
+            <h2>Look</h2>
+            <div class="row"><span class="lab">Position</span><div class="ctl">
+              <select data-key="pos"><option value="tl">Top-left corner</option><option value="c">Centre of tile</option></select></div></div>
+            <div class="row"><span class="lab">Size</span><div class="ctl">
+              <input type="range" data-key="scale" data-mul="100" min="50" max="200" step="5">
+              <span class="val" data-val="scale" data-mul="100" data-suffix="%"></span></div></div>
+            <div class="row"><span class="lab">Left / right</span><div class="ctl">
+              <input type="range" data-key="dx" data-mul="100" min="-30" max="30" step="1">
+              <span class="val" data-val="dx" data-mul="100" data-suffix="%"></span></div></div>
+            <div class="row"><span class="lab">Up / down</span><div class="ctl">
+              <input type="range" data-key="dy" data-mul="100" min="-30" max="30" step="1">
+              <span class="val" data-val="dy" data-mul="100" data-suffix="%"></span></div></div>
+            <div class="row"><span class="lab">Opacity</span><div class="ctl">
+              <input type="range" data-key="opacity" data-mul="100" min="30" max="100" step="5">
+              <span class="val" data-val="opacity" data-mul="100" data-suffix="%"></span></div></div>
+            <div class="row"><span class="lab">Text</span><div class="ctl">
+              <select data-key="text"><option value="full">Number + suit (3m)</option><option value="number">Number only (3)</option></select></div></div>
+            <div class="row"><span class="lab">Honors</span><div class="ctl">
+              <select data-key="honors"><option value="wh">E S W N Wh Gr Rd</option><option value="pfc">E S W N P F C</option></select></div></div>
+            <div class="row"><span class="lab">Red fives</span><div class="ctl">
+              <select data-key="red"><option value="five">5m (gold chip)</option><option value="zero">0m (gold chip)</option></select></div></div>
+            <div class="row"><span class="lab">Colours</span><div class="ctl">
+              <select data-key="palette"><option value="default">Standard</option><option value="contrast">High contrast</option><option value="cb">Colour-blind friendly</option></select></div></div>
+          </div>
+        </div>
+
+        <div class="page" data-page="tr">
+          <label class="chk"><input type="checkbox" data-key="translate"><span>Translate hard-coded Japanese<br><span class="muted">yaku, ranks, rooms, counters, dialogs</span></span></label>
+          <label class="chk"><input type="checkbox" data-key="fillTable"><span>Fix gaps in the game's English text table <span class="muted">(needs reload)</span></span></label>
+          <label class="chk"><input type="checkbox" data-key="forceEn"><span>Force the game language to English <span class="muted">(needs reload)</span></span></label>
+          <label class="chk"><input type="checkbox" data-key="debug"><span>Log untranslated text to the browser console</span></label>
+          <h2>Find untranslated text</h2>
+          <div class="btns" style="margin-top:2px">
+            <button class="b" data-act="scan">Scan this screen</button>
+            <button class="b" data-act="copyscan">Copy result</button>
+          </div>
+          <textarea id="scanout" rows="5" readonly hidden></textarea>
+          <h2>My own translations</h2>
+          <div class="muted">One per line, as <b>日本語 = English</b>. Lines starting with # are ignored. They win over the built-in ones.</div>
+          <textarea id="custom" rows="6" spellcheck="false" placeholder="役満 = Yakuman&#10;# my notes"></textarea>
+          <div class="btns" style="margin-top:6px"><button class="b" data-act="savecustom">Save my translations</button></div>
+          <div class="hint" id="customstat"></div>
+        </div>
+
+        <div class="page" data-page="panel">
+          <h2>Gear button</h2>
+          <div class="row"><span class="lab">Corner</span><div class="ctl">
+            <select data-key="buttonPos"><option value="tl">Top-left</option><option value="tr">Top-right</option>
+              <option value="bl">Bottom-left</option><option value="br">Bottom-right</option></select></div></div>
+          <label class="chk"><input type="checkbox" data-key="buttonHidden"> Fade the button out until the mouse is over it</label>
+          <div class="row"><span class="lab">Shortcut</span><div class="ctl"><kbd>Alt</kbd> + <input type="text" data-key="hotkey" maxlength="1" spellcheck="false"></div></div>
+          <h2>Backup</h2>
+          <div class="muted">Export copies your settings. To import, paste them below and press Import.</div>
+          <textarea id="io" rows="4" spellcheck="false" placeholder="{ ... }"></textarea>
+          <div class="btns">
+            <button class="b" data-act="export">Export</button>
+            <button class="b" data-act="import">Import</button>
+          </div>
+          <h2>Help</h2>
+          <div class="btns" style="margin-top:2px">
+            <button class="b" data-act="report">Copy bug report</button>
+            <button class="b warn" data-act="reset-all">Reset all settings</button>
+          </div>
+        </div>
+
+        <div class="reload" id="reload"><span>Some changes need a reload. Tiles already on screen keep their old look until then.</span>
+          <button class="b" data-act="reload" style="flex:none">Reload now</button></div>
       </div>
-      <textarea id="rep" readonly></textarea>
-    </div></div>`;
+    </div>`;
+
+  // Japanese still on screen, minus player names and score lines.
+  function untranslatedOnScreen() {
+    const api = window.__tenhou4en;
+    return (api && api.scan ? api.scan() : []).filter((t) => !PLAYER_NAMES.has(t) && !PLAYER_SCORE_LINE_RE.test(t));
+  }
 
   // Text for a bug report: versions, settings, counters and the Japanese still
   // on screen.  Player names and score lines are left out.
   function buildReport() {
-    const api = window.__tenhou4en;
-    const left = (api && api.scan ? api.scan() : [])
-      .filter((t) => !PLAYER_NAMES.has(t) && !PLAYER_SCORE_LINE_RE.test(t))
-      .slice(0, 60);
+    const left = untranslatedOnScreen().slice(0, 60);
     const warn = tileHealthMessage();
+    const cfg = Object.assign({}, settings);
+    const customCount = parseCustom(cfg.custom).entries.size;
+    delete cfg.custom;
     return [
       "Tenhou /4 English v" + VERSION,
       "Browser: " + navigator.userAgent,
       "Page: " + location.origin + location.pathname,
-      "Tile settings: " + JSON.stringify(tilesApi.getConfig()),
+      "Settings: " + JSON.stringify(cfg),
+      "Custom translations: " + customCount,
       "Tile stats: " + JSON.stringify(tileStats),
       "Tile warning: " + (warn || "none"),
       "Untranslated Japanese on screen (" + left.length + "):",
@@ -1446,6 +1743,8 @@
       .concat(left.map((t) => "  " + JSON.stringify(t)))
       .join("\n");
   }
+
+  const RELOAD_KEYS = new Set(TILE_KEYS.concat(["forceEn", "fillTable"]));
 
   function installSettingsUI() {
     if (String(location.pathname).indexOf("/4/") !== 0) return null;
@@ -1455,8 +1754,6 @@
       if (!document.body || document.getElementById("tenhou4en-settings")) return;
       const host = document.createElement("div");
       host.id = "tenhou4en-settings";
-      // inline style: beats any page stylesheet rule
-      host.style.cssText = "all:initial;position:fixed;left:8px;top:8px;z-index:2147483000;display:block";
       const root = host.attachShadow({ mode: "open" });
       root.innerHTML = "<style>" + SETTINGS_CSS + "</style>" + SETTINGS_HTML;
       const $ = (id) => root.getElementById(id);
@@ -1481,52 +1778,82 @@
       );
 
       $("ver").textContent = "v" + VERSION;
-      const legend = $("legend");
-      legend.appendChild(document.createTextNode("Colours:"));
-      for (const f of [1, 11, 21, 30, 34, 0]) {
-        const t = tileText(f);
-        const chip = document.createElement("span");
-        chip.className = "chip";
-        chip.textContent = t.text;
-        chip.style.background = t.bg;
-        chip.style.color = t.fg;
-        legend.appendChild(chip);
-      }
-      legend.appendChild(document.createTextNode("(gold = red five)"));
-
-      let timer = null;
-      let flashUntil = 0;
       const panel = $("panel");
       const fab = root.querySelector(".fab");
+      let timer = null;
+      let flashUntil = 0;
+      let needsReload = false;
+      let resetArmed = 0;
 
-      const refresh = () => {
-        const c = tilesApi.getConfig();
-        $("en").checked = c.enabled;
-        $("pos").value = c.pos;
-        $("sc").value = Math.round(c.scale * 100);
-        $("dx").value = Math.round(c.dx * 100);
-        $("dy").value = Math.round(c.dy * 100);
-        $("scv").textContent = Math.round(c.scale * 100) + "%";
-        $("dxv").textContent = Math.round(c.dx * 100) + "%";
-        $("dyv").textContent = Math.round(c.dy * 100) + "%";
-        panel.classList.toggle("off", !c.enabled);
+      // ---------- drawing the current state
+      const renderPreview = () => {
+        const box = $("preview");
+        box.textContent = "";
+        box.appendChild(document.createTextNode("Preview:"));
+        for (const f of [1, 11, 21, 30, 34, 0]) {
+          const t = tileText(f);
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = t.text;
+          chip.style.background = t.bg;
+          chip.style.color = t.fg;
+          if (t.outline) chip.style.textShadow = "0 0 2px #000, 0 0 2px #000";
+          box.appendChild(chip);
+        }
+      };
 
+      const renderStatus = () => {
         if (Date.now() < flashUntil) return;
         const st = $("status");
         const warn = tileHealthMessage();
-        if (!c.enabled) {
-          st.className = "status";
-          st.textContent = "Tile labels are off.";
-        } else if (warn) {
+        st.className = "status";
+        if (!settings.enabled) st.textContent = "Tile labels are off.";
+        else if (warn) {
           st.className = "status warn";
           st.textContent = "Tile labels are not working: " + warn;
-        } else if (tileStats.labeled > 0) {
-          st.className = "status";
-          st.textContent = "Tile labels are working (" + tileStats.labeled + " tile images labelled).";
-        } else {
-          st.className = "status";
-          st.textContent = "Waiting for a game to start...";
-        }
+        } else if (tileStats.labeled > 0) st.textContent = "Tile labels are working (" + tileStats.labeled + " tile images labelled).";
+        else st.textContent = "Waiting for a game to start...";
+      };
+
+      const renderCustomStat = () => {
+        const r = parseCustom(settings.custom);
+        const el = $("customstat");
+        el.textContent =
+          r.entries.size + " of your translation" + (r.entries.size === 1 ? "" : "s") + " active" +
+          (r.errors.length ? ". Ignored: " + r.errors.slice(0, 3).join("; ") + (r.errors.length > 3 ? "; ..." : "") : ".");
+      };
+
+      const applyChrome = () => {
+        const pos = settings.buttonPos;
+        const bottom = pos[0] === "b";
+        const right = pos[1] === "r";
+        host.style.cssText =
+          "all:initial;position:fixed;z-index:2147483000;display:block;" +
+          (bottom ? "bottom:8px;" : "top:8px;") + (right ? "right:8px;" : "left:8px;");
+        const ui_ = $("ui");
+        ui_.classList.toggle("bottom", bottom);
+        ui_.classList.toggle("right", right);
+        ui_.classList.toggle("fade", settings.buttonHidden);
+        $("reload").classList.toggle("show", needsReload);
+      };
+
+      const render = () => {
+        root.querySelectorAll("[data-key]").forEach((el) => {
+          const key = el.getAttribute("data-key");
+          const v = settings[key];
+          if (el.type === "checkbox") el.checked = !!v;
+          else if (el.type === "range") el.value = Math.round(v * Number(el.getAttribute("data-mul") || 1));
+          else el.value = String(v);
+        });
+        root.querySelectorAll("[data-val]").forEach((el) => {
+          const mul = Number(el.getAttribute("data-mul") || 1);
+          el.textContent = Math.round(settings[el.getAttribute("data-val")] * mul) + (el.getAttribute("data-suffix") || "");
+        });
+        $("tiledep").classList.toggle("off", !settings.enabled);
+        renderPreview();
+        renderStatus();
+        renderCustomStat();
+        applyChrome();
       };
 
       const flash = (text, warn) => {
@@ -1534,23 +1861,32 @@
         st.className = "status" + (warn ? " warn" : "");
         st.textContent = text;
         flashUntil = Date.now() + 3500;
-        setTimeout(refresh, 3600);
+        setTimeout(renderStatus, 3600);
       };
 
+      // ---------- opening, closing, tabs
+      const showTab = (name) => {
+        root.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.getAttribute("data-tab") === name));
+        root.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.getAttribute("data-page") === name));
+        if (name === "tiles") renderStatus();
+      };
       const setOpen = (want) => {
         panel.classList.toggle("open", want);
         fab.classList.toggle("on", want);
         clearInterval(timer);
         if (want) {
-          refresh();
-          timer = setInterval(refresh, 1000);
+          $("custom").value = settings.custom;
+          render();
+          timer = setInterval(renderStatus, 1000);
         }
       };
       ui.open = () => setOpen(true);
       ui.close = () => setOpen(false);
       ui.toggle = () => setOpen(!panel.classList.contains("open"));
+      ui.showTab = showTab;
 
-      const copyText = async (text) => {
+      // ---------- clipboard
+      const copyText = async (text, area) => {
         try {
           await navigator.clipboard.writeText(text);
           return true;
@@ -1558,8 +1894,8 @@
           /* fall through to the manual route */
         }
         try {
-          const ta = $("rep");
-          ta.style.display = "block";
+          const ta = area || $("scanout");
+          ta.hidden = false;
           ta.value = text;
           ta.focus();
           ta.select();
@@ -1570,43 +1906,88 @@
       };
 
       fab.addEventListener("click", ui.toggle);
-      $("en").addEventListener("change", () => {
-        tilesApi.setConfig({ enabled: $("en").checked });
-        refresh();
+
+      // ---------- controls bound to settings
+      root.querySelectorAll("[data-key]").forEach((el) => {
+        const key = el.getAttribute("data-key");
+        if (el.type === "checkbox") el.addEventListener("change", () => setSettings({ [key]: el.checked }));
+        else if (el.type === "range") {
+          el.addEventListener("input", () => setSettings({ [key]: Number(el.value) / Number(el.getAttribute("data-mul") || 1) }));
+        } else el.addEventListener("change", () => setSettings({ [key]: el.value }));
       });
-      $("pos").addEventListener("change", () => {
-        tilesApi.setConfig({ pos: $("pos").value });
-        refresh();
+
+      settingListeners.push((keys) => {
+        if (keys.some((k) => RELOAD_KEYS.has(k))) needsReload = true;
+        render();
       });
-      for (const [id, key] of [["sc", "scale"], ["dx", "dx"], ["dy", "dy"]]) {
-        $(id).addEventListener("input", () => {
-          tilesApi.setConfig({ [key]: Number($(id).value) / 100 });
-          refresh();
-        });
-      }
+
+      // ---------- buttons
       root.addEventListener("click", async (e) => {
+        const tab = e.target.closest && e.target.closest("[data-tab]");
+        if (tab) return showTab(tab.getAttribute("data-tab"));
         const btn = e.target.closest && e.target.closest("[data-act]");
         if (!btn) return;
         const act = btn.getAttribute("data-act");
+
+        if (act !== "reset-all") {
+          resetArmed = 0;
+          const b = root.querySelector('[data-act="reset-all"]');
+          if (b) b.textContent = "Reset all settings";
+        }
+
         if (act === "close") ui.close();
-        else if (act === "reset") {
-          tilesApi.resetConfig();
-          refresh();
-          flash("Settings reset.");
-        } else if (act === "reload") location.reload();
-        else if (act === "report") {
-          const ok = await copyText(buildReport());
-          flash(
-            ok ? "Copied. Paste it into your bug report." : "Could not copy - select the text below and copy it.",
-            !ok
-          );
+        else if (act === "reload") location.reload();
+        else if (act === "reset-tiles") {
+          resetSettings(TILE_KEYS);
+          flash("Tile settings reset.");
+        } else if (act === "reset-all") {
+          if (Date.now() > resetArmed) {
+            resetArmed = Date.now() + 3000;
+            btn.textContent = "Click again to confirm";
+            setTimeout(() => {
+              if (Date.now() >= resetArmed) btn.textContent = "Reset all settings";
+            }, 3100);
+          } else {
+            resetArmed = 0;
+            btn.textContent = "Reset all settings";
+            resetSettings();
+            $("custom").value = settings.custom;
+            flash("All settings reset.");
+          }
+        } else if (act === "scan") {
+          const left = untranslatedOnScreen();
+          const out = $("scanout");
+          out.hidden = false;
+          out.value = left.length ? left.join("\n") : "Nothing untranslated on this screen.";
+        } else if (act === "copyscan") {
+          const left = untranslatedOnScreen();
+          const ok = await copyText(left.length ? left.join("\n") : "(nothing untranslated)", $("scanout"));
+          flash(ok ? "Copied." : "Could not copy - select the text and copy it.", !ok);
+        } else if (act === "savecustom") {
+          setSettings({ custom: $("custom").value });
+          renderCustomStat();
+          const r = parseCustom(settings.custom);
+          flash("Saved. " + r.entries.size + " translation" + (r.entries.size === 1 ? "" : "s") + " active.");
+        } else if (act === "export") {
+          const text = exportSettings();
+          const io = $("io");
+          io.value = text;
+          const ok = await copyText(text, io);
+          flash(ok ? "Settings copied." : "Could not copy - select the text and copy it.", !ok);
+        } else if (act === "import") {
+          const r = importSettings($("io").value);
+          $("custom").value = settings.custom;
+          flash(r.ok ? "Imported " + r.count + " settings." : r.error, !r.ok);
+        } else if (act === "report") {
+          const ok = await copyText(buildReport(), $("scanout"));
+          flash(ok ? "Copied. Paste it into your bug report." : "Could not copy - select the text and copy it.", !ok);
         }
       });
       root.addEventListener("keydown", (e) => {
         if (e.key === "Escape") ui.close();
       });
 
-      refresh();
+      render();
       document.body.appendChild(host);
     };
 
@@ -1615,7 +1996,7 @@
     window.addEventListener(
       "keydown",
       (e) => {
-        if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "t" || e.key === "T")) {
+        if (e.altKey && !e.ctrlKey && !e.metaKey && String(e.key).toLowerCase() === settings.hotkey) {
           e.preventDefault();
           ui.toggle();
         }
@@ -1636,7 +2017,14 @@
     version: VERSION,
     playerNames: () => [...PLAYER_NAMES],
     tiles: tilesApi,
-    settings: settingsUi,
+    ui: settingsUi,
+    settings: {
+      get: () => Object.assign({}, settings),
+      set: setSettings,
+      reset: resetSettings,
+      export: exportSettings,
+      import: importSettings,
+    },
     yaku: YAKU,
     ranks: RANKS,
     misc: MISC,
