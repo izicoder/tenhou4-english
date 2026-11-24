@@ -1,10 +1,14 @@
 // ==UserScript==
-// @name         Tenhou /4 English (full)
-// @name:ja      天鳳 /4 英語化
-// @namespace    https://github.com/local/tenhou4-english
-// @version      0.7.0
+// @name         Tenhou /4 English + Tile Labels
+// @name:ja      天鳳 /4 英語化 + 牌ラベル
+// @namespace    https://github.com/izicoder/tenhou4-english
+// @version      0.8.0
 // @description  Completes the English UI on tenhou.net/4 (Desktop4K), translates the Japanese the official EN option leaves behind, and labels every face-up tile (1m 5p E Wh Gr Rd ...).
-// @author       you
+// @author       izicoder
+// @homepageURL  https://github.com/izicoder/tenhou4-english
+// @supportURL   https://github.com/izicoder/tenhou4-english/issues
+// @updateURL    https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
+// @downloadURL  https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js
 // @match        https://tenhou.net/4/*
 // @match        https://tenhou.net/4/
 // @run-at       document-start
@@ -44,7 +48,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.7.0";
+  const VERSION = "0.8.0";
   if (window.__tenhou4enInstalled) {
     console.warn(
       "[tenhou4-en] v" + VERSION + " not started: another copy of this script is " +
@@ -1544,6 +1548,67 @@
 
   tilesApi.install();
 
+  // ------------------------------------------------------------ update check
+  //
+  // Userscript managers update this script by themselves (see @updateURL in
+  // the header).  This is only for the "Check for updates" button in the
+  // panel: it reads the @version line of the published script and compares
+  // it with VERSION.  It runs only when the button is clicked, and the text it
+  // downloads is never executed - only the version number is read from it.
+  //
+  // <update>
+  const REPO_URL = "https://github.com/izicoder/tenhou4-english";
+  const UPDATE_URL = "https://raw.githubusercontent.com/izicoder/tenhou4-english/master/tenhou4-english.user.js";
+
+  function parseScriptVersion(text) {
+    const m = /\/\/\s*@version\s+(\d+(?:\.\d+)*)/.exec(String(text).slice(0, 4000));
+    return m ? m[1] : null;
+  }
+
+  // 1 if a is newer than b, -1 if older, 0 if equal ("0.10.0" > "0.9.0").
+  function compareVersions(a, b) {
+    const pa = String(a).split(".").map(Number);
+    const pb = String(b).split(".").map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const x = pa[i] || 0;
+      const y = pb[i] || 0;
+      if (x !== y) return x > y ? 1 : -1;
+    }
+    return 0;
+  }
+
+  async function checkForUpdate(current, fetchImpl) {
+    try {
+      const res = await (fetchImpl || fetch)(UPDATE_URL, { cache: "no-store" });
+      if (!res.ok) return { state: "error", error: "GitHub answered " + res.status + "." };
+      const latest = parseScriptVersion(await res.text());
+      if (!latest) return { state: "error", error: "Could not read a version number from GitHub." };
+      const c = compareVersions(latest, current);
+      return { state: c > 0 ? "available" : c < 0 ? "newer" : "latest", latest };
+    } catch (e) {
+      return { state: "error", error: "Could not reach GitHub." };
+    }
+  }
+
+  function describeUpdate(r, current) {
+    if (r.state === "latest") return { text: "You are up to date (v" + current + ").", warn: false };
+    if (r.state === "newer") {
+      return { text: "This copy (v" + current + ") is newer than the one on GitHub (v" + r.latest + ").", warn: false };
+    }
+    if (r.state === "available") {
+      return {
+        text:
+          "Version " + r.latest + " is available (you have " + current + "). Your userscript manager normally " +
+          "installs it by itself; to update right now, open the install link.",
+        warn: true,
+        link: UPDATE_URL,
+        linkText: "Install v" + r.latest,
+      };
+    }
+    return { text: (r.error || "Update check failed.") + " You can also use your userscript manager's own update check.", warn: true };
+  }
+  // </update>
+
   // ---------------------------------------------------------- settings panel
   //
   // A small gear button opens a panel with every option, so nothing needs the
@@ -1618,7 +1683,8 @@
     kbd { background: #2a2a36; border: 1px solid #55556a; border-radius: 4px; padding: 0 5px; font: inherit; }
     textarea { display: block; width: 100%; margin-top: 6px; background: #101018; color: #ddd;
       border: 1px solid #444; border-radius: 6px; padding: 5px 6px; font: 12px/1.35 ui-monospace, Consolas, monospace; resize: vertical; }
-    textarea[hidden] { display: none; }
+    textarea[hidden], .status[hidden] { display: none; }
+    a { color: #7cc0ff; }
   `;
 
   const SETTINGS_HTML = `
@@ -1709,6 +1775,11 @@
             <button class="b" data-act="report">Copy bug report</button>
             <button class="b warn" data-act="reset-all">Reset all settings</button>
           </div>
+          <h2>About &amp; updates</h2>
+          <div class="muted"><span id="aboutver"></span> &middot; <a id="repolink" target="_blank" rel="noopener">GitHub page</a> &middot; <a id="buglink" target="_blank" rel="noopener">Report a problem</a></div>
+          <div class="btns" style="margin-top:6px"><button class="b" data-act="update">Check for updates</button></div>
+          <div class="status" id="updatestat" hidden></div>
+          <div class="hint">Your userscript manager also keeps this script up to date by itself. This button contacts GitHub only when you click it.</div>
         </div>
 
         <div class="reload" id="reload"><span>Some changes need a reload. Tiles already on screen keep their old look until then.</span>
@@ -1778,6 +1849,9 @@
       );
 
       $("ver").textContent = "v" + VERSION;
+      $("aboutver").textContent = "Version " + VERSION;
+      $("repolink").href = REPO_URL;
+      $("buglink").href = REPO_URL + "/issues";
       const panel = $("panel");
       const fab = root.querySelector(".fab");
       let timer = null;
@@ -1978,6 +2052,23 @@
           const r = importSettings($("io").value);
           $("custom").value = settings.custom;
           flash(r.ok ? "Imported " + r.count + " settings." : r.error, !r.ok);
+        } else if (act === "update") {
+          const out = $("updatestat");
+          out.hidden = false;
+          out.className = "status";
+          out.textContent = "Checking GitHub...";
+          const d = describeUpdate(await checkForUpdate(VERSION), VERSION);
+          out.className = "status" + (d.warn ? " warn" : "");
+          out.textContent = d.text;
+          if (d.link) {
+            out.appendChild(document.createTextNode(" "));
+            const a = document.createElement("a");
+            a.href = d.link;
+            a.target = "_blank";
+            a.rel = "noopener";
+            a.textContent = d.linkText;
+            out.appendChild(a);
+          }
         } else if (act === "report") {
           const ok = await copyText(buildReport(), $("scanout"));
           flash(ok ? "Copied. Paste it into your bug report." : "Could not copy - select the text and copy it.", !ok);
